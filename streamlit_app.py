@@ -60,6 +60,18 @@ st.markdown("""
         font-weight: 700;
         margin-bottom: 8px;
         text-transform: uppercase;
+        display: flex; align-items: center; gap: 6px;
+    }
+    .rcm-header-content {
+        position: relative;
+        z-index: 2;
+    }
+    .rcm-route-svg {
+        position: absolute;
+        top: 0; right: 0;
+        width: 60%; height: 100%;
+        z-index: 1;
+        pointer-events: none;
     }
     .rcm-title {
         font-size: 30px;
@@ -257,28 +269,6 @@ st.markdown("""
         box-shadow: 0 4px 14px rgba(47,128,237,0.18) !important;
     }
 
-    /* Upload card wrapper */
-    .rcm-upload-card {
-        text-align: center;
-        padding: 6px 0 10px 0;
-    }
-    .rcm-upload-icon {
-        font-size: 26px;
-        margin-bottom: 6px;
-    }
-    .rcm-upload-title {
-        font-size: 14px;
-        font-weight: 600;
-        color: #E8F0FA;
-        margin-bottom: 10px;
-    }
-    .rcm-upload-hint {
-        text-align: center;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 11px;
-        color: #6B84A6;
-        margin-top: 8px;
-    }
     [data-testid="stFileUploaderDropzone"] {
         background: linear-gradient(180deg, #0F1D32, #0A1526) !important;
         border: 2px dashed #2A4A72 !important;
@@ -286,9 +276,32 @@ st.markdown("""
     }
     [data-testid="stFileUploaderDropzone"] button {
         background: linear-gradient(90deg, #2F80ED, #1E63C4) !important;
-        color: #F7FAFD !important;
         border-radius: 8px !important;
         border: none !important;
+        font-size: 0 !important;
+        padding: 9px 20px !important;
+    }
+    [data-testid="stFileUploaderDropzone"] button::after {
+        content: "↑  Upload File";
+        font-size: 13.5px;
+        font-weight: 600;
+        color: #F7FAFD;
+        font-family: 'Inter', sans-serif;
+    }
+    [data-testid="stFileUploaderDropzoneInstructions"] span {
+        font-size: 0 !important;
+        display: block;
+    }
+    [data-testid="stFileUploaderDropzoneInstructions"] span::after {
+        content: "ลากไฟล์ route มาวางที่นี่ หรือคลิกเพื่อเลือกไฟล์";
+        font-size: 14px;
+        font-weight: 600;
+        color: #E8F0FA;
+        font-family: 'Inter', sans-serif;
+    }
+    [data-testid="stFileUploaderDropzoneInstructions"] small {
+        color: #6B84A6 !important;
+        font-family: 'JetBrains Mono', monospace !important;
     }
 
     /* ---------- Dataframe ---------- */
@@ -516,29 +529,44 @@ def stat_box(label, value, sub=""):
 # ============================================================
 st.markdown("""
 <div class="rcm-header">
-    <div class="rcm-eyebrow">🚚 FLEET OPERATIONS · GEO-MATCHING SYSTEM</div>
-    <div class="rcm-title">Route Coordinate Matcher</div>
-    <div class="rcm-subtitle">อัปโหลดไฟล์ route เพื่อจับคู่พิกัดกับ Master Data</div>
-    <div class="rcm-features">
-        <div class="rcm-feature">
-            <div class="rcm-feature-icon">🎯</div>
-            <div class="rcm-feature-text">
-                <div class="rcm-feature-title">Geo-Matching</div>
-                <div class="rcm-feature-sub">จับคู่พิกัดอัตโนมัติ</div>
+    <svg class="rcm-route-svg" viewBox="0 0 400 220" xmlns="http://www.w3.org/2000/svg">
+        <path d="M 60 190 Q 150 170 180 120 T 300 40" stroke="rgba(255,255,255,0.22)" stroke-width="1.5" fill="none" stroke-dasharray="4 5"/>
+        <path d="M 90 200 Q 170 150 220 130 T 330 55" stroke="rgba(255,255,255,0.12)" stroke-width="1" fill="none"/>
+        <circle cx="300" cy="40" r="7" fill="#FF6B35" opacity="0.95">
+            <animate attributeName="opacity" values="0.6;1;0.6" dur="2.4s" repeatCount="indefinite"/>
+        </circle>
+        <circle cx="300" cy="40" r="13" fill="none" stroke="#FF6B35" stroke-width="1.5" opacity="0.5"/>
+        <circle cx="60" cy="190" r="6" fill="#2F80ED" opacity="0.95">
+            <animate attributeName="opacity" values="0.6;1;0.6" dur="2.4s" repeatCount="indefinite" begin="1.2s"/>
+        </circle>
+        <circle cx="60" cy="190" r="11" fill="none" stroke="#2F80ED" stroke-width="1.5" opacity="0.5"/>
+        <circle cx="180" cy="120" r="3.5" fill="#FFB347" opacity="0.8"/>
+    </svg>
+    <div class="rcm-header-content">
+        <div class="rcm-eyebrow">🚚 FLEET OPERATIONS · GEO-MATCHING SYSTEM</div>
+        <div class="rcm-title">Route Coordinate Matcher</div>
+        <div class="rcm-subtitle">อัปโหลดไฟล์ route เพื่อจับคู่พิกัดกับ Master Data</div>
+        <div class="rcm-features">
+            <div class="rcm-feature">
+                <div class="rcm-feature-icon">🎯</div>
+                <div class="rcm-feature-text">
+                    <div class="rcm-feature-title">Geo-Matching</div>
+                    <div class="rcm-feature-sub">จับคู่พิกัดอัตโนมัติ</div>
+                </div>
             </div>
-        </div>
-        <div class="rcm-feature">
-            <div class="rcm-feature-icon">🗄️</div>
-            <div class="rcm-feature-text">
-                <div class="rcm-feature-title">Master Data</div>
-                <div class="rcm-feature-sub">ฐานข้อมูลลูกค้า</div>
+            <div class="rcm-feature">
+                <div class="rcm-feature-icon">🗄️</div>
+                <div class="rcm-feature-text">
+                    <div class="rcm-feature-title">Master Data</div>
+                    <div class="rcm-feature-sub">ฐานข้อมูลลูกค้า</div>
+                </div>
             </div>
-        </div>
-        <div class="rcm-feature">
-            <div class="rcm-feature-icon">🚛</div>
-            <div class="rcm-feature-text">
-                <div class="rcm-feature-title">Fleet Efficiency</div>
-                <div class="rcm-feature-sub">เพิ่มประสิทธิภาพการขนส่ง</div>
+            <div class="rcm-feature">
+                <div class="rcm-feature-icon">🚛</div>
+                <div class="rcm-feature-text">
+                    <div class="rcm-feature-title">Fleet Efficiency</div>
+                    <div class="rcm-feature-sub">เพิ่มประสิทธิภาพการขนส่ง</div>
+                </div>
             </div>
         </div>
     </div>
@@ -590,14 +618,7 @@ if st.session_state['show_master_preview']:
 
 st.write("")
 
-st.markdown("""
-<div class="rcm-upload-card">
-    <div class="rcm-upload-icon">⬆️</div>
-    <div class="rcm-upload-title">ลากไฟล์ route มาวางที่นี่ หรือคลิกเพื่อเลือกไฟล์</div>
-</div>
-""", unsafe_allow_html=True)
 uploaded_file = st.file_uploader("อัพโหลดไฟล์ route", type=['xls', 'xlsx'], label_visibility="collapsed")
-st.markdown('<div class="rcm-upload-hint">📎 200MB per file &nbsp;·&nbsp; XLS, XLSX</div>', unsafe_allow_html=True)
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
