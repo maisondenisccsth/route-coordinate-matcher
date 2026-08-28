@@ -12,14 +12,133 @@ import io
 import re
 from datetime import datetime
 
-st.set_page_config(page_title="Route Coordinate Matcher", page_icon="📍", layout="wide")
+st.set_page_config(page_title="Route Coordinate Matcher", page_icon="🚚", layout="wide")
+
+# ============================================================
+# THEME — Logistics / Transportation style
+# ============================================================
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
+
+    html, body, [class*="css"]  { font-family: 'Inter', sans-serif; }
+
+    .stApp {
+        background: linear-gradient(180deg, #0B1220 0%, #0F1B2E 100%);
+    }
+
+    /* Header band */
+    .rcm-header {
+        background: linear-gradient(90deg, #0F2A4A 0%, #143A63 60%, #0F2A4A 100%);
+        border: 1px solid #1E3A5F;
+        border-radius: 14px;
+        padding: 22px 28px;
+        margin-bottom: 22px;
+        position: relative;
+        overflow: hidden;
+    }
+    .rcm-header::after {
+        content: "";
+        position: absolute;
+        right: -40px; top: -40px;
+        width: 160px; height: 160px;
+        background: radial-gradient(circle, rgba(255,140,66,0.18) 0%, transparent 70%);
+    }
+    .rcm-eyebrow {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px;
+        letter-spacing: 0.15em;
+        color: #FF8C42;
+        font-weight: 600;
+        margin-bottom: 6px;
+        text-transform: uppercase;
+    }
+    .rcm-title {
+        font-size: 28px;
+        font-weight: 800;
+        color: #F4F7FB;
+        margin: 0 0 4px 0;
+        letter-spacing: -0.02em;
+    }
+    .rcm-subtitle {
+        font-size: 14px;
+        color: #8FA8C7;
+        font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* Cards */
+    .rcm-card {
+        background: #101B2E;
+        border: 1px solid #1E3A5F;
+        border-radius: 12px;
+        padding: 18px 20px;
+        margin-bottom: 16px;
+    }
+    .rcm-card-success {
+        border-color: #1F5C42;
+        background: linear-gradient(90deg, rgba(31,92,66,0.15), transparent);
+    }
+    .rcm-card-warn {
+        border-color: #7A5423;
+        background: linear-gradient(90deg, rgba(122,84,35,0.15), transparent);
+    }
+
+    /* Metric-like stat boxes */
+    .rcm-stat {
+        background: #0D1729;
+        border: 1px solid #1E3A5F;
+        border-radius: 10px;
+        padding: 14px 16px;
+        text-align: center;
+    }
+    .rcm-stat-label {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px;
+        color: #6B84A6;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-bottom: 6px;
+    }
+    .rcm-stat-value {
+        font-size: 22px;
+        font-weight: 800;
+        color: #F4F7FB;
+    }
+    .rcm-stat-sub {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px;
+        color: #FF8C42;
+        margin-top: 2px;
+    }
+
+    /* Buttons */
+    .stDownloadButton button, .stButton button {
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+        border: none !important;
+    }
+    .stDownloadButton button {
+        background: linear-gradient(90deg, #FF8C42, #FF6B35) !important;
+        color: #0B1220 !important;
+    }
+
+    /* File uploader */
+    [data-testid="stFileUploaderDropzone"] {
+        background: #0D1729 !important;
+        border: 2px dashed #2A4A72 !important;
+        border-radius: 12px !important;
+    }
+
+    /* Dataframe */
+    [data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
+
+    hr { border-color: #1E3A5F !important; }
+</style>
+""", unsafe_allow_html=True)
 
 # ============================================================
 # CONNECT TO GOOGLE SHEETS (ฐานข้อมูลถาวร)
 # ============================================================
-# ใช้ Google Sheets เป็นที่เก็บ Master Data ถาวร ผ่าน public CSV export link
-# วิธีตั้งค่า: ดูใน DEPLOY_INSTRUCTIONS.md ขั้นตอน "เชื่อม Google Sheets"
-
 MASTER_SHEET_CSV_URL = st.secrets.get("MASTER_SHEET_CSV_URL", "")
 
 
@@ -29,7 +148,7 @@ def normalize(s):
     return re.sub(r'\s+', ' ', str(s).strip().upper().replace('.', '').replace(',', ''))
 
 
-@st.cache_data(ttl=300)  # cache 5 นาที กันโหลดบ่อยเกินไป
+@st.cache_data(ttl=300)
 def load_master_data(url):
     df = pd.read_csv(url)
     df.columns = [c.strip() for c in df.columns]
@@ -117,7 +236,12 @@ def process_route_file(file_bytes, master_df):
                 new_row += [lat, lon]
             else:
                 new_row += [None, None]
-                unmatched.append({'Cust Code': code, 'Ship To Name': ship_val or '', 'Sheet': sheet_name})
+                unmatched.append({
+                    'Cust Code': code,
+                    'Ship To Name': ship_val or '',
+                    'Sheet': sheet_name,
+                    'พบเมื่อ': datetime.now().strftime('%Y-%m-%d'),
+                })
             out_rows.append(new_row)
 
         output_sheets[sheet_name] = pd.DataFrame(out_rows)
@@ -135,11 +259,36 @@ def to_excel_bytes(sheets_dict):
     return output.getvalue()
 
 
+def unmatched_to_excel_bytes(unmatched_df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        unmatched_df.to_excel(writer, sheet_name='Unmatched', index=False)
+        ws = writer.sheets['Unmatched']
+        for i, col in enumerate(unmatched_df.columns, start=1):
+            ws.column_dimensions[chr(64 + i)].width = 28
+    return output.getvalue()
+
+
+def stat_box(label, value, sub=""):
+    st.markdown(f"""
+    <div class="rcm-stat">
+        <div class="rcm-stat-label">{label}</div>
+        <div class="rcm-stat-value">{value}</div>
+        <div class="rcm-stat-sub">{sub}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 # ============================================================
 # UI
 # ============================================================
-st.title("📍 Route Coordinate Matcher")
-st.caption("โยนไฟล์ route → ได้พิกัดกลับมาทันที")
+st.markdown("""
+<div class="rcm-header">
+    <div class="rcm-eyebrow">🚚 FLEET OPERATIONS · GEO-MATCHING SYSTEM</div>
+    <div class="rcm-title">Route Coordinate Matcher</div>
+    <div class="rcm-subtitle">โยนไฟล์ route → ได้พิกัดกลับมาทันที</div>
+</div>
+""", unsafe_allow_html=True)
 
 if not MASTER_SHEET_CSV_URL:
     st.error("⚠️ ยังไม่ได้ตั้งค่า MASTER_SHEET_CSV_URL — ดูวิธีตั้งค่าใน DEPLOY_INSTRUCTIONS.md")
@@ -147,54 +296,93 @@ if not MASTER_SHEET_CSV_URL:
 
 try:
     master_df = load_master_data(MASTER_SHEET_CSV_URL)
-    st.success(f"✅ เชื่อมต่อ Master Data สำเร็จ: {len(master_df):,} รายชื่อลูกค้า")
+    st.markdown(f"""
+    <div class="rcm-card rcm-card-success">
+        ✅ <b>เชื่อมต่อฐานข้อมูลสำเร็จ</b> — {len(master_df):,} รายชื่อลูกค้าในระบบ
+    </div>
+    """, unsafe_allow_html=True)
 except Exception as e:
     st.error(f"โหลด Master Data ไม่สำเร็จ: {e}")
     st.stop()
 
 with st.expander("🔍 ดูตัวอย่าง Master Data"):
-    st.dataframe(master_df[['Cust ID', 'Ship To Name', 'Latitude', 'Longitude']].head(20))
+    st.dataframe(master_df[['Cust ID', 'Ship To Name', 'Latitude', 'Longitude']].head(20), use_container_width=True)
 
 st.divider()
 
-uploaded_file = st.file_uploader("ลากไฟล์ route มาวางที่นี่ หรือคลิกเพื่อเลือกไฟล์", type=['xls', 'xlsx'])
+uploaded_file = st.file_uploader("📦 ลากไฟล์ route มาวางที่นี่ หรือคลิกเพื่อเลือกไฟล์", type=['xls', 'xlsx'])
 
 if uploaded_file is not None:
-    with st.spinner("กำลังประมวลผล..."):
+    with st.spinner("🛰️ กำลังจับคู่พิกัด..."):
         try:
             sheets, report, unmatched = process_route_file(uploaded_file.read(), master_df)
 
             total_matched = sum(r['matched'] for r in report)
             total_rows = sum(r['total'] for r in report)
-            st.success(f"เสร็จแล้ว! จับคู่พิกัดได้ {total_matched:,} / {total_rows:,} แถว")
+            match_rate = (total_matched / total_rows * 100) if total_rows else 0
+
+            card_class = "rcm-card-success" if match_rate >= 90 else "rcm-card-warn"
+            st.markdown(f"""
+            <div class="rcm-card {card_class}">
+                🎯 <b>เสร็จแล้ว!</b> จับคู่พิกัดได้ {total_matched:,} / {total_rows:,} แถว ({match_rate:.1f}%)
+            </div>
+            """, unsafe_allow_html=True)
 
             cols = st.columns(len(report))
             for col, r in zip(cols, report):
                 with col:
                     if r['skipped']:
-                        st.metric(f"Sheet: {r['sheet']}", "ข้าม", "ไม่พบคอลัมน์ Cust Code")
+                        stat_box(f"SHEET: {r['sheet']}", "ข้าม", "ไม่พบคอลัมน์ Cust Code")
                     else:
-                        st.metric(f"Sheet: {r['sheet']}", f"{r['matched']}/{r['total']}",
-                                   f"ShipTo:{r['via_ship']} Code:{r['via_code']}")
+                        stat_box(f"SHEET: {r['sheet']}", f"{r['matched']}/{r['total']}",
+                                  f"SHIP-TO {r['via_ship']} · CODE {r['via_code']}")
 
-            output_bytes = to_excel_bytes(sheets)
-            base_name = uploaded_file.name.rsplit('.', 1)[0]
-            st.download_button(
-                "⬇️ ดาวน์โหลดไฟล์พร้อมพิกัด",
-                data=output_bytes,
-                file_name=f"{base_name}_with_coordinates.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            st.write("")
+            dl_col1, dl_col2 = st.columns(2)
 
-            if unmatched:
-                st.warning(f"⚠️ มี {len(unmatched)} รายการที่ยังไม่มีพิกัด")
-                unmatched_df = pd.DataFrame(unmatched).drop_duplicates(subset=['Cust Code'])
-                st.dataframe(unmatched_df, use_container_width=True)
-                st.info("💡 นำ Cust Code เหล่านี้ไปเพิ่มพิกัดใน Google Sheets Master Data แล้วรีเฟรชหน้านี้")
+            with dl_col1:
+                output_bytes = to_excel_bytes(sheets)
+                base_name = uploaded_file.name.rsplit('.', 1)[0]
+                st.download_button(
+                    "⬇️ ดาวน์โหลดไฟล์พร้อมพิกัด",
+                    data=output_bytes,
+                    file_name=f"{base_name}_with_coordinates.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+            unmatched_df = pd.DataFrame(unmatched).drop_duplicates(subset=['Cust Code']) if unmatched else pd.DataFrame()
+
+            with dl_col2:
+                if not unmatched_df.empty:
+                    unmatched_bytes = unmatched_to_excel_bytes(unmatched_df)
+                    st.download_button(
+                        f"📋 ดาวน์โหลดรายการที่ยังไม่มีพิกัด ({len(unmatched_df)})",
+                        data=unmatched_bytes,
+                        file_name=f"unmatched_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                else:
+                    st.markdown("""
+                    <div class="rcm-card rcm-card-success" style="text-align:center;">
+                        ✅ ไม่มีรายการตกหล่น — พิกัดครบทุกแถว
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            if not unmatched_df.empty:
+                st.write("")
+                st.markdown(f"""
+                <div class="rcm-card rcm-card-warn">
+                    ⚠️ <b>มี {len(unmatched_df)} รายการที่ยังไม่มีพิกัด</b> — ใช้ไฟล์ที่ดาวน์โหลดด้านบนไปเพิ่มลงใน Master Data ได้เลย
+                </div>
+                """, unsafe_allow_html=True)
+                st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
+                st.caption("💡 นำ Cust Code เหล่านี้ไปเพิ่มพิกัดใน Google Sheets Master Data แล้วรีเฟรชหน้านี้ (หรือรอ cache หมดอายุใน 5 นาที)")
 
         except Exception as e:
             st.error(f"เกิดข้อผิดพลาด: {e}")
             st.exception(e)
 
 st.divider()
-st.caption(f"Master Data อัพเดตล่าสุด (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} — ข้อมูลรีเฟรชทุก 5 นาที")
+st.caption(f"🛰️ Master Data sync (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} — รีเฟรชทุก 5 นาที")
