@@ -368,7 +368,7 @@ def normalize(s):
     return re.sub(r'\s+', ' ', str(s).strip().upper().replace('.', '').replace(',', ''))
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def load_master_data(url):
     df = pd.read_csv(url)
     df.columns = [c.strip() for c in df.columns]
@@ -809,4 +809,4 @@ if uploaded_file is not None:
             st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
 
 st.markdown('<div class="rcm-glow-divider"></div>', unsafe_allow_html=True)
-st.caption(f"🛰️ Master Data sync (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} — รีเฟรชอัตโนมัติทุก 1 นาที หรือกด \"ซิงค์ตอนนี้\" ด้านบนเพื่อดึงข้อมูลล่าสุดทันที")
+st.caption(f"🛰️ Master Data sync (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} — รีเฟรชอัตโนมัติทุก 5 นาที หรือกด \"ซิงค์ตอนนี้\" ด้านบนเพื่อดึงข้อมูลล่าสุดทันที")
