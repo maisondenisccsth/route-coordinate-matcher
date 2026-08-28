@@ -160,6 +160,22 @@ st.markdown("""
         background: #34C759;
         box-shadow: 0 0 6px #34C759;
     }
+    .rcm-sync-btn-wrap { height: 100%; display: flex; align-items: center; }
+    .rcm-sync-btn-wrap .stButton { width: 100%; }
+    .rcm-sync-btn-wrap .stButton button {
+        height: 100%;
+        min-height: 66px;
+        background: linear-gradient(180deg, #101E33, #0C1728) !important;
+        border: 1px solid #1E3A5F !important;
+        color: #C3D4EA !important;
+        font-size: 12px !important;
+        white-space: normal !important;
+        line-height: 1.3;
+    }
+    .rcm-sync-btn-wrap .stButton button:hover {
+        border-color: #FF8C42 !important;
+        color: #F7FAFD !important;
+    }
 
     /* Expander styled like clickable list card */
     div[data-testid="stExpander"] {
@@ -352,7 +368,7 @@ def normalize(s):
     return re.sub(r'\s+', ' ', str(s).strip().upper().replace('.', '').replace(',', ''))
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def load_master_data(url):
     df = pd.read_csv(url)
     df.columns = [c.strip() for c in df.columns]
@@ -616,21 +632,29 @@ if not MASTER_SHEET_CSV_URL:
 
 try:
     master_df = load_master_data(MASTER_SHEET_CSV_URL)
-    st.markdown(f"""
-    <div class="rcm-status-card">
-        <div class="rcm-status-left">
-            <div class="rcm-status-icon">✅</div>
-            <div>
-                <div class="rcm-status-title">เชื่อมต่อฐานข้อมูลสำเร็จ</div>
-                <div class="rcm-status-sub">{len(master_df):,} รายชื่อลูกค้าในระบบ</div>
+    status_col, sync_col = st.columns([5, 1])
+    with status_col:
+        st.markdown(f"""
+        <div class="rcm-status-card">
+            <div class="rcm-status-left">
+                <div class="rcm-status-icon">✅</div>
+                <div>
+                    <div class="rcm-status-title">เชื่อมต่อฐานข้อมูลสำเร็จ</div>
+                    <div class="rcm-status-sub">{len(master_df):,} รายชื่อลูกค้าในระบบ</div>
+                </div>
+            </div>
+            <div class="rcm-status-right">
+                <div class="rcm-status-right-icon">🗃️</div>
+                <div class="rcm-status-pill"><span class="rcm-status-dot"></span>Connected</div>
             </div>
         </div>
-        <div class="rcm-status-right">
-            <div class="rcm-status-right-icon">🗃️</div>
-            <div class="rcm-status-pill"><span class="rcm-status-dot"></span>Connected</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
+    with sync_col:
+        st.markdown('<div class="rcm-sync-btn-wrap">', unsafe_allow_html=True)
+        if st.button("🔄 ซิงค์ตอนนี้", use_container_width=True, help="ดึงข้อมูล Master Data ล่าสุดจาก Google Sheets ทันที"):
+            load_master_data.clear()
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
 except Exception as e:
     st.error(f"โหลด Master Data ไม่สำเร็จ: {e}")
     st.stop()
@@ -785,4 +809,4 @@ if uploaded_file is not None:
             st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
 
 st.markdown('<div class="rcm-glow-divider"></div>', unsafe_allow_html=True)
-st.caption(f"🛰️ Master Data sync (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} — รีเฟรชทุก 5 นาที")
+st.caption(f"🛰️ Master Data sync (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} — รีเฟรชอัตโนมัติทุก 1 นาที หรือกด \"ซิงค์ตอนนี้\" ด้านบนเพื่อดึงข้อมูลล่าสุดทันที")
