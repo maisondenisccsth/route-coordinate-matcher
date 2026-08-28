@@ -30,33 +30,27 @@ st.markdown("""
             linear-gradient(180deg, #070C16 0%, #0B1524 45%, #0A1220 100%);
     }
 
-    /* ---------- Header ---------- */
+    /* ---------- Header (with photo) ---------- */
     .rcm-header {
-        background: linear-gradient(120deg, #0D1F38 0%, #123056 45%, #0D1F38 100%);
+        background:
+            linear-gradient(100deg, rgba(9,17,32,0.94) 0%, rgba(11,22,40,0.85) 40%, rgba(11,22,40,0.35) 75%, rgba(11,22,40,0.15) 100%),
+            url('https://images.unsplash.com/photo-1601584115197-04ecc0da31d7?auto=format&fit=crop&w=1600&q=80');
+        background-size: cover;
+        background-position: center 60%;
         border: 1px solid #204A78;
         border-radius: 18px;
-        padding: 30px 34px;
-        margin-bottom: 26px;
+        padding: 30px 34px 24px 34px;
+        margin-bottom: 22px;
         position: relative;
         overflow: hidden;
-        box-shadow: 0 10px 40px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.04);
-    }
-    .rcm-header::after {
-        content: "";
-        position: absolute;
-        right: -60px; top: -60px;
-        width: 260px; height: 260px;
-        background: radial-gradient(circle, rgba(255,140,66,0.22) 0%, transparent 70%);
+        box-shadow: 0 10px 40px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.04);
+        min-height: 210px;
     }
     .rcm-header::before {
         content: "";
         position: absolute;
         left: 0; bottom: 0; width: 100%; height: 3px;
         background: linear-gradient(90deg, #FF6B35 0%, #FFB347 35%, transparent 75%);
-    }
-    .rcm-road {
-        position: absolute; right: 34px; top: 50%; transform: translateY(-50%);
-        font-size: 64px; opacity: 0.10; line-height: 1;
     }
     .rcm-eyebrow {
         font-family: 'JetBrains Mono', monospace;
@@ -68,16 +62,103 @@ st.markdown("""
         text-transform: uppercase;
     }
     .rcm-title {
-        font-size: 32px;
+        font-size: 30px;
         font-weight: 800;
         color: #F7FAFD;
         margin: 0 0 6px 0;
         letter-spacing: -0.02em;
+        text-shadow: 0 2px 12px rgba(0,0,0,0.5);
     }
     .rcm-subtitle {
-        font-size: 14.5px;
-        color: #9FB8D9;
+        font-size: 14px;
+        color: #C3D4EA;
         font-family: 'JetBrains Mono', monospace;
+        margin-bottom: 20px;
+    }
+    .rcm-features {
+        display: flex;
+        gap: 28px;
+        flex-wrap: wrap;
+    }
+    .rcm-feature {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .rcm-feature-icon {
+        width: 30px; height: 30px;
+        border-radius: 8px;
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.14);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 15px;
+        flex-shrink: 0;
+    }
+    .rcm-feature-text {
+        line-height: 1.25;
+    }
+    .rcm-feature-title {
+        font-size: 12.5px;
+        font-weight: 700;
+        color: #F0F5FA;
+    }
+    .rcm-feature-sub {
+        font-size: 10.5px;
+        color: #92A9C4;
+        font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* ---------- Status / connection card ---------- */
+    .rcm-status-card {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: linear-gradient(90deg, rgba(42,110,76,0.20), rgba(12,23,40,0.55));
+        border: 1px solid #2A6E4C;
+        border-radius: 14px;
+        padding: 16px 22px;
+        margin-bottom: 14px;
+        box-shadow: 0 4px 18px rgba(0,0,0,0.22);
+    }
+    .rcm-status-left { display: flex; align-items: center; gap: 14px; }
+    .rcm-status-icon {
+        width: 38px; height: 38px; border-radius: 10px;
+        background: rgba(52,199,89,0.18);
+        border: 1px solid rgba(52,199,89,0.4);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 17px;
+    }
+    .rcm-status-title { font-weight: 700; color: #F0F5FA; font-size: 14.5px; }
+    .rcm-status-sub { font-size: 11.5px; color: #8FA8C7; font-family: 'JetBrains Mono', monospace; }
+    .rcm-status-right { display: flex; align-items: center; gap: 8px; }
+    .rcm-status-right-icon {
+        width: 34px; height: 34px; border-radius: 9px;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.12);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 15px;
+    }
+    .rcm-status-pill {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px; color: #6FE39A; font-weight: 700;
+        display: flex; align-items: center; gap: 5px;
+    }
+    .rcm-status-dot {
+        width: 6px; height: 6px; border-radius: 50%;
+        background: #34C759;
+        box-shadow: 0 0 6px #34C759;
+    }
+
+    /* Expander styled like clickable list card */
+    div[data-testid="stExpander"] {
+        border: 1px solid #1E3A5F !important;
+        border-radius: 14px !important;
+        background: linear-gradient(90deg, rgba(47,128,237,0.10), rgba(12,23,40,0.55)) !important;
+        overflow: hidden;
+    }
+    div[data-testid="stExpander"] summary {
+        padding: 14px 20px !important;
+        font-weight: 600 !important;
     }
 
     /* ---------- Cards ---------- */
@@ -162,6 +243,12 @@ st.markdown("""
         background: linear-gradient(180deg, #0F1D32, #0A1526) !important;
         border: 2px dashed #2A4A72 !important;
         border-radius: 14px !important;
+    }
+    [data-testid="stFileUploaderDropzone"] button {
+        background: linear-gradient(90deg, #2F80ED, #1E63C4) !important;
+        color: #F7FAFD !important;
+        border-radius: 8px !important;
+        border: none !important;
     }
 
     /* ---------- Dataframe ---------- */
@@ -389,10 +476,32 @@ def stat_box(label, value, sub=""):
 # ============================================================
 st.markdown("""
 <div class="rcm-header">
-    <div class="rcm-road">🛣️</div>
     <div class="rcm-eyebrow">🚚 FLEET OPERATIONS · GEO-MATCHING SYSTEM</div>
     <div class="rcm-title">Route Coordinate Matcher</div>
-    <div class="rcm-subtitle">โยนไฟล์ route → ได้พิกัดกลับมาทันที</div>
+    <div class="rcm-subtitle">อัปโหลดไฟล์ route เพื่อจับคู่พิกัดกับ Master Data</div>
+    <div class="rcm-features">
+        <div class="rcm-feature">
+            <div class="rcm-feature-icon">🎯</div>
+            <div class="rcm-feature-text">
+                <div class="rcm-feature-title">Geo-Matching</div>
+                <div class="rcm-feature-sub">จับคู่พิกัดอัตโนมัติ</div>
+            </div>
+        </div>
+        <div class="rcm-feature">
+            <div class="rcm-feature-icon">🗄️</div>
+            <div class="rcm-feature-text">
+                <div class="rcm-feature-title">Master Data</div>
+                <div class="rcm-feature-sub">ฐานข้อมูลลูกค้า</div>
+            </div>
+        </div>
+        <div class="rcm-feature">
+            <div class="rcm-feature-icon">🚛</div>
+            <div class="rcm-feature-text">
+                <div class="rcm-feature-title">Fleet Efficiency</div>
+                <div class="rcm-feature-sub">เพิ่มประสิทธิภาพการขนส่ง</div>
+            </div>
+        </div>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -403,20 +512,31 @@ if not MASTER_SHEET_CSV_URL:
 try:
     master_df = load_master_data(MASTER_SHEET_CSV_URL)
     st.markdown(f"""
-    <div class="rcm-card rcm-card-success">
-        ✅ <b>เชื่อมต่อฐานข้อมูลสำเร็จ</b> — {len(master_df):,} รายชื่อลูกค้าในระบบ
+    <div class="rcm-status-card">
+        <div class="rcm-status-left">
+            <div class="rcm-status-icon">✅</div>
+            <div>
+                <div class="rcm-status-title">เชื่อมต่อฐานข้อมูลสำเร็จ</div>
+                <div class="rcm-status-sub">{len(master_df):,} รายชื่อลูกค้าในระบบ</div>
+            </div>
+        </div>
+        <div class="rcm-status-right">
+            <div class="rcm-status-right-icon">🗃️</div>
+            <div class="rcm-status-pill"><span class="rcm-status-dot"></span>Connected</div>
+        </div>
     </div>
     """, unsafe_allow_html=True)
 except Exception as e:
     st.error(f"โหลด Master Data ไม่สำเร็จ: {e}")
     st.stop()
 
-with st.expander("🔍 ดูตัวอย่าง Master Data"):
+with st.expander("📄  ดูตัวอย่าง Master Data — ตรวจสอบข้อมูลลูกค้าและเส้นทางก่อนประมวลผล"):
     st.dataframe(master_df[['Cust ID', 'Ship To Name', 'Latitude', 'Longitude']].head(20), use_container_width=True)
 
-st.divider()
+st.write("")
 
-uploaded_file = st.file_uploader("📦 ลากไฟล์ route มาวางที่นี่ หรือคลิกเพื่อเลือกไฟล์", type=['xls', 'xlsx'])
+st.markdown("##### 📤 ลากไฟล์ route มาวางที่นี่ หรือคลิกเพื่อเลือกไฟล์")
+uploaded_file = st.file_uploader("อัพโหลดไฟล์ route", type=['xls', 'xlsx'], label_visibility="collapsed")
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
