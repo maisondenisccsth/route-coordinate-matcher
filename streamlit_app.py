@@ -356,13 +356,13 @@ def normalize(s):
 def load_master_data(url):
     df = pd.read_csv(url)
     df.columns = [c.strip() for c in df.columns]
-    required = ['Cust ID', 'Ship To Name', 'Latitude', 'Longitude']
+    required = ['Ship To', 'Ship To Name', 'Latitude', 'Longitude']
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"ไม่พบคอลัมน์: {', '.join(missing)} กรุณาตรวจสอบหัวตารางใน Google Sheets")
-    df = df.dropna(subset=['Cust ID', 'Latitude', 'Longitude'])
+    df = df.dropna(subset=['Ship To', 'Latitude', 'Longitude'])
     df['norm_ship'] = df['Ship To Name'].apply(normalize)
-    df['norm_code'] = df['Cust ID'].astype(str).str.strip().str.upper()
+    df['norm_code'] = df['Ship To'].astype(str).str.strip().str.upper()
     return df
 
 
@@ -633,7 +633,7 @@ if preview_clicked:
     st.rerun()
 
 if st.session_state['show_master_preview']:
-    st.dataframe(master_df[['Cust ID', 'Ship To Name', 'Latitude', 'Longitude']].head(20), use_container_width=True)
+    st.dataframe(master_df[['Ship To', 'Ship To Name', 'Latitude', 'Longitude']].head(20), use_container_width=True)
 
 st.write("")
 
