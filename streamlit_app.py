@@ -41,8 +41,15 @@ st.markdown("""
         content: "";
         position: absolute;
         right: -40px; top: -40px;
-        width: 160px; height: 160px;
-        background: radial-gradient(circle, rgba(255,140,66,0.18) 0%, transparent 70%);
+        width: 180px; height: 180px;
+        background: radial-gradient(circle, rgba(255,140,66,0.20) 0%, transparent 70%);
+    }
+    .rcm-header::before {
+        content: "";
+        position: absolute;
+        left: 0; bottom: 0;
+        width: 100%; height: 3px;
+        background: linear-gradient(90deg, #FF6B35, transparent 60%);
     }
     .rcm-eyebrow {
         font-family: 'JetBrains Mono', monospace;
@@ -73,23 +80,29 @@ st.markdown("""
         border-radius: 12px;
         padding: 18px 20px;
         margin-bottom: 16px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.15);
     }
     .rcm-card-success {
         border-color: #1F5C42;
-        background: linear-gradient(90deg, rgba(31,92,66,0.15), transparent);
+        background: linear-gradient(90deg, rgba(31,92,66,0.16), rgba(16,27,46,0.4));
     }
     .rcm-card-warn {
         border-color: #7A5423;
-        background: linear-gradient(90deg, rgba(122,84,35,0.15), transparent);
+        background: linear-gradient(90deg, rgba(122,84,35,0.16), rgba(16,27,46,0.4));
     }
 
-    /* Metric-like stat boxes */
+    /* Stat boxes */
     .rcm-stat {
         background: #0D1729;
         border: 1px solid #1E3A5F;
         border-radius: 10px;
         padding: 14px 16px;
         text-align: center;
+        transition: border-color 0.15s ease, transform 0.15s ease;
+    }
+    .rcm-stat:hover {
+        border-color: #FF8C42;
+        transform: translateY(-1px);
     }
     .rcm-stat-label {
         font-family: 'JetBrains Mono', monospace;
@@ -171,7 +184,7 @@ def find_header_row(rows, keys):
     return None, None
 
 
-def process_route_file(file_bytes, master_df):
+def process_route_file(file_bytes, master_df, selected_sheets=None):
     xl = pd.ExcelFile(io.BytesIO(file_bytes))
     output_sheets = {}
     report = []
@@ -180,7 +193,9 @@ def process_route_file(file_bytes, master_df):
     by_ship = master_df.drop_duplicates('norm_ship').set_index('norm_ship')
     by_code = master_df.drop_duplicates('norm_code').set_index('norm_code')
 
-    for sheet_name in xl.sheet_names:
+    sheet_list = selected_sheets if selected_sheets is not None else xl.sheet_names
+
+    for sheet_name in sheet_list:
         raw = xl.parse(sheet_name, header=None).values.tolist()
         header_row, cust_col = find_header_row(raw, ['cust code', 'cust id'])
 
@@ -313,76 +328,102 @@ st.divider()
 uploaded_file = st.file_uploader("📦 ลากไฟล์ route มาวางที่นี่ หรือคลิกเพื่อเลือกไฟล์", type=['xls', 'xlsx'])
 
 if uploaded_file is not None:
-    with st.spinner("🛰️ กำลังจับคู่พิกัด..."):
-        try:
-            sheets, report, unmatched = process_route_file(uploaded_file.read(), master_df)
+    file_bytes = uploaded_file.read()
 
-            total_matched = sum(r['matched'] for r in report)
-            total_rows = sum(r['total'] for r in report)
-            match_rate = (total_matched / total_rows * 100) if total_rows else 0
+    try:
+        xl_peek = pd.ExcelFile(io.BytesIO(file_bytes))
+        all_sheet_names = xl_peek.sheet_names
+    except Exception as e:
+        st.error(f"เปิดไฟล์ไม่ได้: {e}")
+        st.stop()
 
-            card_class = "rcm-card-success" if match_rate >= 90 else "rcm-card-warn"
-            st.markdown(f"""
-            <div class="rcm-card {card_class}">
-                🎯 <b>เสร็จแล้ว!</b> จับคู่พิกัดได้ {total_matched:,} / {total_rows:,} แถว ({match_rate:.1f}%)
-            </div>
-            """, unsafe_allow_html=True)
+    st.markdown("##### 📑 เลือก Sheet ที่ต้องการประมวลผล")
+    sheet_cols = st.columns(min(len(all_sheet_names), 4))
+    selected_sheets = []
+    for i, sn in enumerate(all_sheet_names):
+        with sheet_cols[i % len(sheet_cols)]:
+            checked = st.checkbox(sn, value=True, key=f"sheet_{sn}")
+            if checked:
+                selected_sheets.append(sn)
 
-            cols = st.columns(len(report))
-            for col, r in zip(cols, report):
-                with col:
-                    if r['skipped']:
-                        stat_box(f"SHEET: {r['sheet']}", "ข้าม", "ไม่พบคอลัมน์ Cust Code")
-                    else:
-                        stat_box(f"SHEET: {r['sheet']}", f"{r['matched']}/{r['total']}",
-                                  f"SHIP-TO {r['via_ship']} · CODE {r['via_code']}")
+    if not selected_sheets:
+        st.warning("⚠️ กรุณาเลือกอย่างน้อย 1 Sheet เพื่อเริ่มประมวลผล")
+        st.stop()
 
-            st.write("")
-            dl_col1, dl_col2 = st.columns(2)
+    st.write("")
+    process_clicked = st.button("🚀 ประมวลผล Sheet ที่เลือก", type="primary", use_container_width=True)
 
-            with dl_col1:
-                output_bytes = to_excel_bytes(sheets)
-                base_name = uploaded_file.name.rsplit('.', 1)[0]
-                st.download_button(
-                    "⬇️ ดาวน์โหลดไฟล์พร้อมพิกัด",
-                    data=output_bytes,
-                    file_name=f"{base_name}_with_coordinates.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
+    if process_clicked:
+        with st.spinner("🛰️ กำลังจับคู่พิกัด..."):
+            try:
+                sheets, report, unmatched = process_route_file(file_bytes, master_df, selected_sheets)
 
-            unmatched_df = pd.DataFrame(unmatched).drop_duplicates(subset=['Cust Code']) if unmatched else pd.DataFrame()
+                total_matched = sum(r['matched'] for r in report)
+                total_rows = sum(r['total'] for r in report)
+                match_rate = (total_matched / total_rows * 100) if total_rows else 0
 
-            with dl_col2:
-                if not unmatched_df.empty:
-                    unmatched_bytes = unmatched_to_excel_bytes(unmatched_df)
+                card_class = "rcm-card-success" if match_rate >= 90 else "rcm-card-warn"
+                st.markdown(f"""
+                <div class="rcm-card {card_class}">
+                    🎯 <b>เสร็จแล้ว!</b> จับคู่พิกัดได้ {total_matched:,} / {total_rows:,} แถว ({match_rate:.1f}%)
+                </div>
+                """, unsafe_allow_html=True)
+
+                cols = st.columns(len(report))
+                for col, r in zip(cols, report):
+                    with col:
+                        if r['skipped']:
+                            stat_box(f"SHEET: {r['sheet']}", "ข้าม", "ไม่พบคอลัมน์ Cust Code")
+                        else:
+                            stat_box(f"SHEET: {r['sheet']}", f"{r['matched']}/{r['total']}",
+                                      f"SHIP-TO {r['via_ship']} · CODE {r['via_code']}")
+
+                st.write("")
+                dl_col1, dl_col2 = st.columns(2)
+
+                with dl_col1:
+                    output_bytes = to_excel_bytes(sheets)
+                    base_name = uploaded_file.name.rsplit('.', 1)[0]
                     st.download_button(
-                        f"📋 ดาวน์โหลดรายการที่ยังไม่มีพิกัด ({len(unmatched_df)})",
-                        data=unmatched_bytes,
-                        file_name=f"unmatched_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                        "⬇️ ดาวน์โหลดไฟล์พร้อมพิกัด",
+                        data=output_bytes,
+                        file_name=f"{base_name}_with_coordinates.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
-                else:
-                    st.markdown("""
-                    <div class="rcm-card rcm-card-success" style="text-align:center;">
-                        ✅ ไม่มีรายการตกหล่น — พิกัดครบทุกแถว
+
+                unmatched_df = pd.DataFrame(unmatched).drop_duplicates(subset=['Cust Code']) if unmatched else pd.DataFrame()
+
+                with dl_col2:
+                    if not unmatched_df.empty:
+                        unmatched_bytes = unmatched_to_excel_bytes(unmatched_df)
+                        st.download_button(
+                            f"📋 ดาวน์โหลดรายการที่ยังไม่มีพิกัด ({len(unmatched_df)})",
+                            data=unmatched_bytes,
+                            file_name=f"unmatched_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.markdown("""
+                        <div class="rcm-card rcm-card-success" style="text-align:center;">
+                            ✅ ไม่มีรายการตกหล่น — พิกัดครบทุกแถว
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                if not unmatched_df.empty:
+                    st.write("")
+                    st.markdown(f"""
+                    <div class="rcm-card rcm-card-warn">
+                        ⚠️ <b>มี {len(unmatched_df)} รายการที่ยังไม่มีพิกัด</b> — ใช้ไฟล์ที่ดาวน์โหลดด้านบนไปเพิ่มลงใน Master Data ได้เลย
                     </div>
                     """, unsafe_allow_html=True)
+                    st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
+                    st.caption("💡 นำ Cust Code เหล่านี้ไปเพิ่มพิกัดใน Google Sheets Master Data แล้วรีเฟรชหน้านี้ (หรือรอ cache หมดอายุใน 5 นาที)")
 
-            if not unmatched_df.empty:
-                st.write("")
-                st.markdown(f"""
-                <div class="rcm-card rcm-card-warn">
-                    ⚠️ <b>มี {len(unmatched_df)} รายการที่ยังไม่มีพิกัด</b> — ใช้ไฟล์ที่ดาวน์โหลดด้านบนไปเพิ่มลงใน Master Data ได้เลย
-                </div>
-                """, unsafe_allow_html=True)
-                st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
-                st.caption("💡 นำ Cust Code เหล่านี้ไปเพิ่มพิกัดใน Google Sheets Master Data แล้วรีเฟรชหน้านี้ (หรือรอ cache หมดอายุใน 5 นาที)")
-
-        except Exception as e:
-            st.error(f"เกิดข้อผิดพลาด: {e}")
-            st.exception(e)
+            except Exception as e:
+                st.error(f"เกิดข้อผิดพลาด: {e}")
+                st.exception(e)
 
 st.divider()
 st.caption(f"🛰️ Master Data sync (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} — รีเฟรชทุก 5 นาที")
