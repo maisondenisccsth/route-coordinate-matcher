@@ -238,7 +238,47 @@ st.markdown("""
         box-shadow: 0 4px 16px rgba(47,128,237,0.3) !important;
     }
 
-    /* ---------- File uploader ---------- */
+    /* Custom "preview" toggle button styled as a list card */
+    .rcm-preview-toggle-wrap .stButton button {
+        background: linear-gradient(90deg, rgba(47,128,237,0.10), rgba(12,23,40,0.55)) !important;
+        border: 1px solid #1E3A5F !important;
+        border-radius: 14px !important;
+        color: #E8F0FA !important;
+        text-align: left !important;
+        justify-content: flex-start !important;
+        padding: 16px 20px !important;
+        font-weight: 500 !important;
+        font-size: 13.5px !important;
+        box-shadow: none !important;
+    }
+    .rcm-preview-toggle-wrap .stButton button:hover {
+        border-color: #2F80ED !important;
+        transform: none !important;
+        box-shadow: 0 4px 14px rgba(47,128,237,0.18) !important;
+    }
+
+    /* Upload card wrapper */
+    .rcm-upload-card {
+        text-align: center;
+        padding: 6px 0 10px 0;
+    }
+    .rcm-upload-icon {
+        font-size: 26px;
+        margin-bottom: 6px;
+    }
+    .rcm-upload-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: #E8F0FA;
+        margin-bottom: 10px;
+    }
+    .rcm-upload-hint {
+        text-align: center;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px;
+        color: #6B84A6;
+        margin-top: 8px;
+    }
     [data-testid="stFileUploaderDropzone"] {
         background: linear-gradient(180deg, #0F1D32, #0A1526) !important;
         border: 2px dashed #2A4A72 !important;
@@ -530,13 +570,34 @@ except Exception as e:
     st.error(f"โหลด Master Data ไม่สำเร็จ: {e}")
     st.stop()
 
-with st.expander("📄  ดูตัวอย่าง Master Data — ตรวจสอบข้อมูลลูกค้าและเส้นทางก่อนประมวลผล"):
+if 'show_master_preview' not in st.session_state:
+    st.session_state['show_master_preview'] = False
+
+chevron = "▾" if st.session_state['show_master_preview'] else "▸"
+st.markdown('<div class="rcm-preview-toggle-wrap">', unsafe_allow_html=True)
+preview_clicked = st.button(
+    f"📄   ดูตัวอย่าง Master Data — ตรวจสอบข้อมูลลูกค้าและเส้นทางก่อนประมวลผล   {chevron}",
+    key="master_preview_toggle",
+    use_container_width=True,
+)
+st.markdown('</div>', unsafe_allow_html=True)
+if preview_clicked:
+    st.session_state['show_master_preview'] = not st.session_state['show_master_preview']
+    st.rerun()
+
+if st.session_state['show_master_preview']:
     st.dataframe(master_df[['Cust ID', 'Ship To Name', 'Latitude', 'Longitude']].head(20), use_container_width=True)
 
 st.write("")
 
-st.markdown("##### 📤 ลากไฟล์ route มาวางที่นี่ หรือคลิกเพื่อเลือกไฟล์")
+st.markdown("""
+<div class="rcm-upload-card">
+    <div class="rcm-upload-icon">⬆️</div>
+    <div class="rcm-upload-title">ลากไฟล์ route มาวางที่นี่ หรือคลิกเพื่อเลือกไฟล์</div>
+</div>
+""", unsafe_allow_html=True)
 uploaded_file = st.file_uploader("อัพโหลดไฟล์ route", type=['xls', 'xlsx'], label_visibility="collapsed")
+st.markdown('<div class="rcm-upload-hint">📎 200MB per file &nbsp;·&nbsp; XLS, XLSX</div>', unsafe_allow_html=True)
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
