@@ -402,6 +402,19 @@ def process_route_file(file_bytes, master_df, selected_sheets=None):
                 ship_col = i
                 break
 
+        # ถ้าไม่มีคอลัมน์ ShipTo Name ในชีทนี้เลย ให้ใช้ Cust Name (หรือคอลัมน์ชื่ออื่นที่ใกล้เคียง) แทน
+        name_fallback_col = None
+        if ship_col is None:
+            for i, v in enumerate(header):
+                if isinstance(v, str) and 'cust' in v.lower() and 'name' in v.lower():
+                    name_fallback_col = i
+                    break
+            if name_fallback_col is None:
+                for i, v in enumerate(header):
+                    if isinstance(v, str) and 'name' in v.lower() and 'ship' not in v.lower():
+                        name_fallback_col = i
+                        break
+
         out_rows = []
         matched = total = via_ship = via_code = 0
 
@@ -420,7 +433,12 @@ def process_route_file(file_bytes, master_df, selected_sheets=None):
 
             code = str(cust_val).strip()
             total += 1
-            ship_val = row[ship_col] if (ship_col is not None and ship_col < len(row)) else None
+            if ship_col is not None and ship_col < len(row):
+                ship_val = row[ship_col]
+            elif name_fallback_col is not None and name_fallback_col < len(row):
+                ship_val = row[name_fallback_col]
+            else:
+                ship_val = None
 
             hit = None
             if ship_val:
