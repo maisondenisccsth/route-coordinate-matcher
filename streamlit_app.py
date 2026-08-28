@@ -278,15 +278,34 @@ st.markdown("""
         background: linear-gradient(90deg, #2F80ED, #1E63C4) !important;
         border-radius: 8px !important;
         border: none !important;
-        font-size: 0 !important;
+        outline: none !important;
+        box-shadow: none !important;
+        position: relative !important;
         padding: 9px 20px !important;
+        min-width: 150px;
+        min-height: 38px;
+    }
+    [data-testid="stFileUploaderDropzone"] button:focus,
+    [data-testid="stFileUploaderDropzone"] button:focus-visible {
+        outline: none !important;
+        box-shadow: none !important;
+        border-color: transparent !important;
+    }
+    [data-testid="stFileUploaderDropzone"] button * {
+        display: none !important;
     }
     [data-testid="stFileUploaderDropzone"] button::after {
         content: "↑  Upload File";
+        position: absolute;
+        inset: 0;
+        display: flex !important;
+        align-items: center;
+        justify-content: center;
         font-size: 13.5px;
         font-weight: 600;
         color: #F7FAFD;
         font-family: 'Inter', sans-serif;
+        white-space: nowrap;
     }
     [data-testid="stFileUploaderDropzoneInstructions"] span {
         font-size: 0 !important;
