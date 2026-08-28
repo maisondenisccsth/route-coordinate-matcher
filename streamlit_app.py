@@ -632,6 +632,7 @@ if not MASTER_SHEET_CSV_URL:
 
 try:
     master_df = load_master_data(MASTER_SHEET_CSV_URL)
+    unique_customer_count = master_df['norm_ship'].nunique()
     status_col, sync_col = st.columns([5, 1])
     with status_col:
         st.markdown(f"""
@@ -640,7 +641,7 @@ try:
                 <div class="rcm-status-icon">✅</div>
                 <div>
                     <div class="rcm-status-title">เชื่อมต่อฐานข้อมูลสำเร็จ</div>
-                    <div class="rcm-status-sub">{len(master_df):,} รายชื่อลูกค้าในระบบ</div>
+                    <div class="rcm-status-sub">{unique_customer_count:,} รายชื่อลูกค้าในระบบ (ไม่ซ้ำ)</div>
                 </div>
             </div>
             <div class="rcm-status-right">
