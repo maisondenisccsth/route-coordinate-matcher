@@ -431,6 +431,13 @@ def process_route_file(file_bytes, master_df, selected_sheets=None):
                         name_fallback_col = i
                         break
 
+        # ระบุ "โหมด" การจับคู่ของทั้งชีทนี้ ครั้งเดียวตอนเจอ header (ไม่ใช่ทีละแถว):
+        #   - ถ้ามีคอลัมน์ ShipTo Name หรือ Cust Name -> ใช้ชื่อจับคู่กับ Master ทุกแถวในชีทนี้
+        #     (แถวไหน match ไม่ได้ ให้ถือว่า "ไม่มีพิกัด" ไปเลย ห้ามหลุดไปเดาด้วย Cust Code
+        #      เพราะลูกค้า 1 รายอาจมีหลายสาขา การเดาด้วยโค้ดระดับลูกค้าจะได้พิกัดสาขาอื่นมาแบบผิดๆ)
+        #   - ถ้าชีทนี้ไม่มีทั้งสองคอลัมน์เลย -> ทั้งชีทจะจับคู่ด้วย Cust Code <-> Ship To (Master) แทน
+        use_code_fallback_for_sheet = (ship_col is None and name_fallback_col is None)
+
         out_rows = []
         matched = total = via_ship = via_code = 0
 
@@ -457,12 +464,15 @@ def process_route_file(file_bytes, master_df, selected_sheets=None):
                 ship_val = None
 
             hit = None
-            if ship_val:
-                key = normalize(ship_val)
-                if key in by_ship.index:
-                    hit = by_ship.loc[key]
-                    via_ship += 1
-            if hit is None:
+            if not use_code_fallback_for_sheet:
+                # โหมดจับคู่ด้วยชื่อ: ลองครั้งเดียว ไม่ fallback ไป Cust Code ต่อแถวต่อแถว
+                if ship_val:
+                    key = normalize(ship_val)
+                    if key in by_ship.index:
+                        hit = by_ship.loc[key]
+                        via_ship += 1
+            else:
+                # โหมดนี้ใช้เมื่อทั้งชีทไม่มีคอลัมน์ชื่อเลย -> จับคู่ด้วย Cust Code <-> Ship To (Master)
                 key = code.upper()
                 if key in by_code.index:
                     hit = by_code.loc[key]
