@@ -391,14 +391,21 @@ def find_header_row(rows, keys):
     return None, None
 
 
-def process_route_file(file_bytes, master_df, selected_sheets=None):
+def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipto=True):
     xl = pd.ExcelFile(io.BytesIO(file_bytes))
     output_sheets = {}
     report = []
     unmatched = []
+    ambiguous = []
 
     by_ship = master_df.drop_duplicates('norm_ship').set_index('norm_ship')
     by_code = master_df.drop_duplicates('norm_code').set_index('norm_code')
+
+    ambiguous_ship_keys = set()
+    if not dedupe_shipto:
+        # หา Ship To Name ที่ซ้ำกันแต่พิกัด "ขัดแย้งกันจริง" (คนละสาขา) เพื่อไม่เดาสุ่มเลือกสาขาใดสาขาหนึ่ง
+        grp = master_df.groupby('norm_ship')[['Latitude', 'Longitude']].nunique()
+        ambiguous_ship_keys = set(grp[(grp['Latitude'] > 1) | (grp['Longitude'] > 1)].index)
 
     sheet_list = selected_sheets if selected_sheets is not None else xl.sheet_names
 
@@ -464,11 +471,16 @@ def process_route_file(file_bytes, master_df, selected_sheets=None):
                 ship_val = None
 
             hit = None
+            is_ambiguous = False
             if not use_code_fallback_for_sheet:
                 # โหมดจับคู่ด้วยชื่อ: ลองครั้งเดียว ไม่ fallback ไป Cust Code ต่อแถวต่อแถว
                 if ship_val:
                     key = normalize(ship_val)
-                    if key in by_ship.index:
+                    if key in ambiguous_ship_keys:
+                        # ชื่อนี้ซ้ำในหลายสาขาที่พิกัดขัดแย้งกัน (เช่น Big C หลายสาขาชื่อเดียวกัน)
+                        # ไม่เดาว่าเป็นสาขาไหน -> ถือว่ายังไม่มีพิกัด แล้วบันทึกแยกไว้ให้ตรวจสอบ
+                        is_ambiguous = True
+                    elif key in by_ship.index:
                         hit = by_ship.loc[key]
                         via_ship += 1
             else:
@@ -484,6 +496,17 @@ def process_route_file(file_bytes, master_df, selected_sheets=None):
                 lat = hit['Latitude'].iloc[0] if hasattr(hit['Latitude'], 'iloc') else hit['Latitude']
                 lon = hit['Longitude'].iloc[0] if hasattr(hit['Longitude'], 'iloc') else hit['Longitude']
                 new_row += [lat, lon]
+            elif is_ambiguous:
+                new_row += [None, None]
+                dup_rows = master_df[master_df['norm_ship'] == normalize(ship_val)]
+                branch_count = len(dup_rows.drop_duplicates(subset=['Latitude', 'Longitude']))
+                ambiguous.append({
+                    'Cust Code': code,
+                    'Ship To Name': ship_val or '',
+                    'Sheet': sheet_name,
+                    'จำนวนสาขาที่ชื่อซ้ำ': branch_count,
+                    'พบเมื่อ': datetime.now().strftime('%Y-%m-%d'),
+                })
             else:
                 new_row += [None, None]
                 unmatched.append({
@@ -491,6 +514,7 @@ def process_route_file(file_bytes, master_df, selected_sheets=None):
                     'Ship To Name': ship_val or '',
                     'Sheet': sheet_name,
                     'พบเมื่อ': datetime.now().strftime('%Y-%m-%d'),
+
                 })
             out_rows.append(new_row)
 
@@ -498,7 +522,7 @@ def process_route_file(file_bytes, master_df, selected_sheets=None):
         report.append({'sheet': sheet_name, 'skipped': False, 'matched': matched, 'total': total,
                         'via_ship': via_ship, 'via_code': via_code})
 
-    return output_sheets, report, unmatched
+    return output_sheets, report, unmatched, ambiguous
 
 
 def to_excel_bytes(sheets_dict):
@@ -586,10 +610,6 @@ def stat_box(label, value, sub=""):
     </div>
     """, unsafe_allow_html=True)
 
-
-# ============================================================
-# HEADER
-# ============================================================
 st.markdown("""
 <div class="rcm-header">
     <svg class="rcm-route-svg" viewBox="0 0 400 220" xmlns="http://www.w3.org/2000/svg">
@@ -715,16 +735,25 @@ if uploaded_file is not None:
         st.warning("⚠️ กรุณาเลือกอย่างน้อย 1 Sheet เพื่อเริ่มประมวลผล")
         st.stop()
 
+    dedupe_shipto = st.checkbox(
+        "✨ ทำให้ Ship To Name ไม่ซ้ำกันอัตโนมัติ (เลือกแถวแรกที่เจอ)",
+        value=True,
+        help="เปิด (ค่าเริ่มต้น): ถ้าชื่อซ้ำกันในระบบ จะเลือกแถวแรกที่เจอมาใช้ทันที เร็ว แต่ถ้าเป็นเชนร้านที่มีหลายสาขาชื่อเดียวกัน (เช่น Big C) อาจได้พิกัดผิดสาขา\n\nปิด: ถ้าเจอชื่อซ้ำที่พิกัดขัดแย้งกันจริง (คนละสาขา) จะไม่เดา — ถือว่ายังไม่มีพิกัด แล้วแยกไปอยู่ลิสต์ 'ชื่อซ้ำ-ต้องตรวจสอบ' แทน ปลอดภัยกว่าแต่ match ได้น้อยลง",
+    )
+
     st.write("")
     process_clicked = st.button("🚀 ประมวลผล Sheet ที่เลือก", type="primary", use_container_width=True)
 
     if process_clicked:
         with st.spinner("🛰️ กำลังจับคู่พิกัด..."):
             try:
-                sheets, report, unmatched = process_route_file(file_bytes, master_df, selected_sheets)
+                sheets, report, unmatched, ambiguous = process_route_file(
+                    file_bytes, master_df, selected_sheets, dedupe_shipto=dedupe_shipto
+                )
                 st.session_state['last_sheets'] = sheets
                 st.session_state['last_report'] = report
                 st.session_state['last_unmatched'] = unmatched
+                st.session_state['last_ambiguous'] = ambiguous
                 st.session_state['last_filename'] = uploaded_file.name
             except Exception as e:
                 st.error(f"เกิดข้อผิดพลาด: {e}")
@@ -734,6 +763,7 @@ if uploaded_file is not None:
         sheets = st.session_state['last_sheets']
         report = st.session_state['last_report']
         unmatched = st.session_state['last_unmatched']
+        ambiguous = st.session_state.get('last_ambiguous', [])
 
         total_matched = sum(r['matched'] for r in report)
         total_rows = sum(r['total'] for r in report)
@@ -818,6 +848,25 @@ if uploaded_file is not None:
             </div>
             """, unsafe_allow_html=True)
             st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
+
+        ambiguous_df = pd.DataFrame(ambiguous).drop_duplicates(subset=['Cust Code']) if ambiguous else pd.DataFrame()
+        if not ambiguous_df.empty:
+            st.write("")
+            st.markdown(f"""
+            <div class="rcm-card rcm-card-warn">
+                🔀 <b>พบ {len(ambiguous_df)} รายการที่ชื่อซ้ำในหลายสาขา (พิกัดขัดแย้งกัน)</b> —
+                ระบบไม่กล้าเดาว่าเป็นสาขาไหน กรุณาเปิด Master Data แล้วแก้ Ship To Name ให้ระบุสาขาชัดเจน (เช่น เพิ่มชื่อสาขาต่อท้าย) แล้วลองประมวลผลใหม่
+            </div>
+            """, unsafe_allow_html=True)
+            st.dataframe(ambiguous_df, use_container_width=True, hide_index=True)
+            ambiguous_bytes = unmatched_to_excel_bytes(ambiguous_df)
+            st.download_button(
+                f"🔀 ดาวน์โหลดรายการชื่อซ้ำที่ต้องตรวจสอบ ({len(ambiguous_df)})",
+                data=ambiguous_bytes,
+                file_name=f"ambiguous_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
 st.markdown('<div class="rcm-glow-divider"></div>', unsafe_allow_html=True)
 st.caption(f"🛰️ Master Data sync (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} — รีเฟรชอัตโนมัติทุก 5 นาที หรือกด \"ซิงค์ตอนนี้\" ด้านบนเพื่อดึงข้อมูลล่าสุดทันที")
