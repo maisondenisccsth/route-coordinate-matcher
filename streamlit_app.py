@@ -394,10 +394,10 @@ def find_header_row(rows, keys):
 def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipto=True):
     xl = pd.ExcelFile(io.BytesIO(file_bytes))
     output_sheets = {}
+    unique_stops_sheets = {}  # เวอร์ชัน "จุดส่งไม่ซ้ำ" คอลัมน์เหมือนไฟล์หลักทุกอย่าง แค่ยุบแถวพิกัดซ้ำ
     report = []
     unmatched = []
     ambiguous = []
-    matched_stops = []  # เก็บทุกแถวที่จับคู่พิกัดสำเร็จ ไว้ทำสรุป "จุดส่งไม่ซ้ำ" ทีหลัง
 
     by_ship = master_df.drop_duplicates('norm_ship').set_index('norm_ship')
     by_code = master_df.drop_duplicates('norm_code').set_index('norm_code')
@@ -497,13 +497,6 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
                 lat = hit['Latitude'].iloc[0] if hasattr(hit['Latitude'], 'iloc') else hit['Latitude']
                 lon = hit['Longitude'].iloc[0] if hasattr(hit['Longitude'], 'iloc') else hit['Longitude']
                 new_row += [lat, lon]
-                matched_stops.append({
-                    'display_name': (ship_val if ship_val else code),
-                    'Cust Code': code,
-                    'Latitude': lat,
-                    'Longitude': lon,
-                    'Sheet': sheet_name,
-                })
             elif is_ambiguous:
                 new_row += [None, None]
                 dup_rows = master_df[master_df['norm_ship'] == normalize(ship_val)]
@@ -530,7 +523,36 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
         report.append({'sheet': sheet_name, 'skipped': False, 'matched': matched, 'total': total,
                         'via_ship': via_ship, 'via_code': via_code})
 
-    return output_sheets, report, unmatched, ambiguous, matched_stops
+        # ---- สร้างเวอร์ชัน "จุดส่งไม่ซ้ำ" ของชีทนี้ ----
+        # ใช้ template เดียวกับ out_rows เป๊ะ (คอลัมน์เดิมทั้งหมด + Latitude/Longitude)
+        # แค่ยุบแถวที่พิกัด (2 คอลัมน์สุดท้าย) ซ้ำกันให้เหลือแถวแรกที่เจอ แล้วเติมคอลัมน์นับจำนวนออเดอร์ต่อท้าย
+        preamble_and_header = out_rows[:header_row + 1]
+        data_rows = out_rows[header_row + 1:]
+
+        seen_order = []
+        seen_row = {}
+        seen_count = {}
+        for row in data_rows:
+            lat_val, lon_val = row[-2], row[-1]
+            if lat_val is None or lon_val is None:
+                continue  # ไม่มีพิกัด -> ไม่เอาเข้าไฟล์จุดส่งไม่ซ้ำ (ยังไป route ไม่ได้อยู่ดี)
+            key = (lat_val, lon_val)
+            if key not in seen_row:
+                seen_row[key] = row
+                seen_count[key] = 1
+                seen_order.append(key)
+            else:
+                seen_count[key] += 1
+
+        unique_header = list(preamble_and_header[-1]) + ['จำนวนออเดอร์รวม'] if preamble_and_header else \
+            list(raw[header_row]) + ['Latitude', 'Longitude', 'จำนวนออเดอร์รวม']
+        unique_data_rows = [list(seen_row[k]) + [seen_count[k]] for k in seen_order]
+        unique_sheet_rows = preamble_and_header[:-1] + [unique_header] + unique_data_rows if preamble_and_header else \
+            [unique_header] + unique_data_rows
+        unique_stops_sheets[sheet_name] = pd.DataFrame(unique_sheet_rows)
+        report[-1]['unique_stops'] = len(unique_data_rows)
+
+    return output_sheets, report, unmatched, ambiguous, unique_stops_sheets
 
 
 def to_excel_bytes(sheets_dict):
@@ -606,33 +628,6 @@ def unmatched_to_excel_bytes(unmatched_df):
         ws = writer.sheets['Unmatched']
         for i, col in enumerate(unmatched_df.columns, start=1):
             ws.column_dimensions[chr(64 + i)].width = 28
-    return output.getvalue()
-
-
-def build_unique_stops_df(matched_stops):
-    """รวมทุกแถวที่จับคู่พิกัดสำเร็จ ให้เหลือ 1 แถวต่อ 1 พิกัด (จุดส่งของ) —
-    เหมาะสำหรับ import เข้า OptimoRoute หรือระบบวางแผนเส้นทางอื่นๆ ที่ไม่ต้องการพิกัดซ้ำ"""
-    if not matched_stops:
-        return pd.DataFrame(columns=['Location Name', 'Cust Code', 'Latitude', 'Longitude', 'จำนวนออเดอร์รวม'])
-    df = pd.DataFrame(matched_stops)
-    grouped = df.groupby(['Latitude', 'Longitude'], as_index=False).agg(
-        **{
-            'Location Name': ('display_name', 'first'),
-            'Cust Code': ('Cust Code', 'first'),
-            'จำนวนออเดอร์รวม': ('display_name', 'count'),
-        }
-    )
-    return grouped[['Location Name', 'Cust Code', 'Latitude', 'Longitude', 'จำนวนออเดอร์รวม']].sort_values('Location Name').reset_index(drop=True)
-
-
-def unique_stops_to_excel_bytes(stops_df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        stops_df.to_excel(writer, sheet_name='Unique Stops', index=False)
-        ws = writer.sheets['Unique Stops']
-        widths = {'A': 42, 'B': 14, 'C': 12, 'D': 12, 'E': 16}
-        for col, w in widths.items():
-            ws.column_dimensions[col].width = w
     return output.getvalue()
 
 
@@ -786,14 +781,14 @@ if uploaded_file is not None:
     if process_clicked:
         with st.spinner("🛰️ กำลังจับคู่พิกัด..."):
             try:
-                sheets, report, unmatched, ambiguous, matched_stops = process_route_file(
+                sheets, report, unmatched, ambiguous, unique_stops_sheets = process_route_file(
                     file_bytes, master_df, selected_sheets, dedupe_shipto=dedupe_shipto
                 )
                 st.session_state['last_sheets'] = sheets
                 st.session_state['last_report'] = report
                 st.session_state['last_unmatched'] = unmatched
                 st.session_state['last_ambiguous'] = ambiguous
-                st.session_state['last_matched_stops'] = matched_stops
+                st.session_state['last_unique_stops_sheets'] = unique_stops_sheets
                 st.session_state['last_filename'] = uploaded_file.name
             except Exception as e:
                 st.error(f"เกิดข้อผิดพลาด: {e}")
@@ -804,7 +799,7 @@ if uploaded_file is not None:
         report = st.session_state['last_report']
         unmatched = st.session_state['last_unmatched']
         ambiguous = st.session_state.get('last_ambiguous', [])
-        matched_stops = st.session_state.get('last_matched_stops', [])
+        unique_stops_sheets = st.session_state.get('last_unique_stops_sheets', {})
 
         total_matched = sum(r['matched'] for r in report)
         total_rows = sum(r['total'] for r in report)
@@ -882,16 +877,16 @@ if uploaded_file is not None:
                 """, unsafe_allow_html=True)
 
         with dl_col3:
-            unique_stops_df = build_unique_stops_df(matched_stops)
-            if not unique_stops_df.empty:
-                stops_bytes = unique_stops_to_excel_bytes(unique_stops_df)
+            total_unique_stops = sum(r.get('unique_stops', 0) for r in report)
+            if unique_stops_sheets and total_unique_stops > 0:
+                stops_bytes = to_excel_bytes(unique_stops_sheets)
                 st.download_button(
-                    f"📍 จุดส่งไม่ซ้ำ สำหรับ OptimoRoute ({len(unique_stops_df)})",
+                    f"📍 จุดส่งไม่ซ้ำ สำหรับ OptimoRoute ({total_unique_stops})",
                     data=stops_bytes,
                     file_name=f"{base_name}_unique_stops.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
-                    help="รวมออเดอร์ที่พิกัดเดียวกันให้เหลือ 1 แถวต่อ 1 จุด พร้อมนับจำนวนออเดอร์ที่รวมกันไว้ในคอลัมน์สุดท้าย",
+                    help="คอลัมน์เหมือนไฟล์หลักทุกอย่าง เพิ่มแค่คอลัมน์ 'จำนวนออเดอร์รวม' — ยุบแถวที่พิกัดซ้ำกันให้เหลือ 1 แถวต่อ 1 จุด",
                 )
 
         if not unmatched_df.empty:
