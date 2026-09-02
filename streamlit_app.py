@@ -532,11 +532,16 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
         seen_order = []
         seen_row = {}
         seen_count = {}
+        no_coord_counter = 0
         for row in data_rows:
             lat_val, lon_val = row[-2], row[-1]
             if lat_val is None or lon_val is None:
-                continue  # ไม่มีพิกัด -> ไม่เอาเข้าไฟล์จุดส่งไม่ซ้ำ (ยังไป route ไม่ได้อยู่ดี)
-            key = (lat_val, lon_val)
+                # ไม่มีพิกัด -> ยังคงเก็บแถวนี้ไว้เหมือนเดิม (ห้ามลบทิ้งเงียบๆ) แค่ไม่เอาไปยุบรวมกับแถวไหน
+                # เพราะไม่รู้ว่ามันคือจุดเดียวกับแถวอื่นไหนหรือเปล่า
+                key = ('__NOCOORD__', no_coord_counter)
+                no_coord_counter += 1
+            else:
+                key = (lat_val, lon_val)
             if key not in seen_row:
                 seen_row[key] = row
                 seen_count[key] = 1
