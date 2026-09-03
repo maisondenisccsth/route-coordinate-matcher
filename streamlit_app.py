@@ -357,6 +357,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 MASTER_SHEET_CSV_URL = st.secrets.get("MASTER_SHEET_CSV_URL", "")
+PRODUCT_SHEET_CSV_URL = st.secrets.get("PRODUCT_SHEET_CSV_URL", "")
 
 
 # ============================================================
@@ -379,6 +380,21 @@ def load_master_data(url):
     df = df.dropna(subset=['Ship To', 'Latitude', 'Longitude'])
     df['norm_ship'] = df['Ship To Name'].apply(normalize)
     df['norm_code'] = df['Ship To'].astype(str).str.strip().str.upper()
+    return df
+
+
+@st.cache_data(ttl=300)
+def load_product_master(url):
+    # Product Master มี 2 แถวหัวเรื่อง (Ownership, แผนก) อยู่เหนือแถวชื่อคอลัมน์จริง
+    # แถวชื่อคอลัมน์จริงคือแถวที่ 3 (index 2)
+    df = pd.read_csv(url, header=2)
+    df.columns = [c.strip() for c in df.columns]
+    required = ['SKUCode', 'PRODUCT']
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"ไม่พบคอลัมน์: {', '.join(missing)} กรุณาตรวจสอบหัวตารางใน Google Sheets")
+    df = df.dropna(subset=['SKUCode'])
+    df['SKUCode'] = df['SKUCode'].astype(str).str.strip()
     return df
 
 
@@ -695,232 +711,296 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-if not MASTER_SHEET_CSV_URL:
-    st.error("⚠️ ยังไม่ได้ตั้งค่า MASTER_SHEET_CSV_URL — ดูวิธีตั้งค่าใน DEPLOY_INSTRUCTIONS.md")
-    st.stop()
+tab_process, tab_product = st.tabs(["📤  ประมวลผลไฟล์", "📦  Product Master"])
 
-try:
-    master_df = load_master_data(MASTER_SHEET_CSV_URL)
-    unique_customer_count = master_df['norm_ship'].nunique()
-    status_col, sync_col = st.columns([5, 1])
-    with status_col:
-        st.markdown(f"""
-        <div class="rcm-status-card">
-            <div class="rcm-status-left">
-                <div class="rcm-status-icon">✅</div>
-                <div>
-                    <div class="rcm-status-title">เชื่อมต่อฐานข้อมูลสำเร็จ</div>
-                    <div class="rcm-status-sub">{unique_customer_count:,} รายชื่อลูกค้าในระบบ (ไม่ซ้ำ)</div>
-                </div>
-            </div>
-            <div class="rcm-status-right">
-                <div class="rcm-status-right-icon">🗃️</div>
-                <div class="rcm-status-pill"><span class="rcm-status-dot"></span>Connected</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    with sync_col:
-        st.markdown('<div class="rcm-sync-btn-wrap">', unsafe_allow_html=True)
-        if st.button("🔄 ซิงค์ตอนนี้", use_container_width=True, help="ดึงข้อมูล Master Data ล่าสุดจาก Google Sheets ทันที"):
-            load_master_data.clear()
-            st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
-except Exception as e:
-    st.error(f"โหลด Master Data ไม่สำเร็จ: {e}")
-    st.stop()
-
-if 'show_master_preview' not in st.session_state:
-    st.session_state['show_master_preview'] = False
-
-chevron = "▾" if st.session_state['show_master_preview'] else "▸"
-st.markdown('<div class="rcm-preview-toggle-wrap">', unsafe_allow_html=True)
-preview_clicked = st.button(
-    f"📄   ดูตัวอย่าง Master Data — ตรวจสอบข้อมูลลูกค้าและเส้นทางก่อนประมวลผล   {chevron}",
-    key="master_preview_toggle",
-    use_container_width=True,
-)
-st.markdown('</div>', unsafe_allow_html=True)
-if preview_clicked:
-    st.session_state['show_master_preview'] = not st.session_state['show_master_preview']
-    st.rerun()
-
-if st.session_state['show_master_preview']:
-    st.dataframe(master_df[['Ship To', 'Ship To Name', 'Latitude', 'Longitude']].head(20), use_container_width=True)
-
-st.write("")
-
-uploaded_file = st.file_uploader("อัพโหลดไฟล์ route", type=['xls', 'xlsx'], label_visibility="collapsed")
-
-if uploaded_file is not None:
-    file_bytes = uploaded_file.read()
+with tab_process:
+    if not MASTER_SHEET_CSV_URL:
+        st.error("⚠️ ยังไม่ได้ตั้งค่า MASTER_SHEET_CSV_URL — ดูวิธีตั้งค่าใน DEPLOY_INSTRUCTIONS.md")
+        st.stop()
 
     try:
-        xl_peek = pd.ExcelFile(io.BytesIO(file_bytes))
-        all_sheet_names = xl_peek.sheet_names
+        master_df = load_master_data(MASTER_SHEET_CSV_URL)
+        unique_customer_count = master_df['norm_ship'].nunique()
+        status_col, sync_col = st.columns([5, 1])
+        with status_col:
+            st.markdown(f"""
+            <div class="rcm-status-card">
+                <div class="rcm-status-left">
+                    <div class="rcm-status-icon">✅</div>
+                    <div>
+                        <div class="rcm-status-title">เชื่อมต่อฐานข้อมูลสำเร็จ</div>
+                        <div class="rcm-status-sub">{unique_customer_count:,} รายชื่อลูกค้าในระบบ (ไม่ซ้ำ)</div>
+                    </div>
+                </div>
+                <div class="rcm-status-right">
+                    <div class="rcm-status-right-icon">🗃️</div>
+                    <div class="rcm-status-pill"><span class="rcm-status-dot"></span>Connected</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        with sync_col:
+            st.markdown('<div class="rcm-sync-btn-wrap">', unsafe_allow_html=True)
+            if st.button("🔄 ซิงค์ตอนนี้", use_container_width=True, help="ดึงข้อมูล Master Data ล่าสุดจาก Google Sheets ทันที"):
+                load_master_data.clear()
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
     except Exception as e:
-        st.error(f"เปิดไฟล์ไม่ได้: {e}")
+        st.error(f"โหลด Master Data ไม่สำเร็จ: {e}")
         st.stop()
 
-    st.markdown("##### 📑 เลือก Sheet ที่ต้องการประมวลผล")
-    sheet_cols = st.columns(min(len(all_sheet_names), 4))
-    selected_sheets = []
-    for i, sn in enumerate(all_sheet_names):
-        with sheet_cols[i % len(sheet_cols)]:
-            checked = st.checkbox(sn, value=True, key=f"sheet_{sn}")
-            if checked:
-                selected_sheets.append(sn)
+    if 'show_master_preview' not in st.session_state:
+        st.session_state['show_master_preview'] = False
 
-    if not selected_sheets:
-        st.warning("⚠️ กรุณาเลือกอย่างน้อย 1 Sheet เพื่อเริ่มประมวลผล")
-        st.stop()
-
-    dedupe_shipto = st.checkbox(
-        "✨ ทำให้ Ship To Name ไม่ซ้ำกันอัตโนมัติ (เลือกแถวแรกที่เจอ)",
-        value=True,
-        help="เปิด (ค่าเริ่มต้น): ถ้าชื่อซ้ำกันในระบบ จะเลือกแถวแรกที่เจอมาใช้ทันที เร็ว แต่ถ้าเป็นเชนร้านที่มีหลายสาขาชื่อเดียวกัน (เช่น Big C) อาจได้พิกัดผิดสาขา\n\nปิด: ถ้าเจอชื่อซ้ำที่พิกัดขัดแย้งกันจริง (คนละสาขา) จะไม่เดา — ถือว่ายังไม่มีพิกัด แล้วแยกไปอยู่ลิสต์ 'ชื่อซ้ำ-ต้องตรวจสอบ' แทน ปลอดภัยกว่าแต่ match ได้น้อยลง",
+    chevron = "▾" if st.session_state['show_master_preview'] else "▸"
+    st.markdown('<div class="rcm-preview-toggle-wrap">', unsafe_allow_html=True)
+    preview_clicked = st.button(
+        f"📄   ดูตัวอย่าง Master Data — ตรวจสอบข้อมูลลูกค้าและเส้นทางก่อนประมวลผล   {chevron}",
+        key="master_preview_toggle",
+        use_container_width=True,
     )
+    st.markdown('</div>', unsafe_allow_html=True)
+    if preview_clicked:
+        st.session_state['show_master_preview'] = not st.session_state['show_master_preview']
+        st.rerun()
+
+    if st.session_state['show_master_preview']:
+        st.dataframe(master_df[['Ship To', 'Ship To Name', 'Latitude', 'Longitude']].head(20), use_container_width=True)
 
     st.write("")
-    process_clicked = st.button("🚀 ประมวลผล Sheet ที่เลือก", type="primary", use_container_width=True)
 
-    if process_clicked:
-        with st.spinner("🛰️ กำลังจับคู่พิกัด..."):
-            try:
-                sheets, report, unmatched, ambiguous, unique_stops_sheets = process_route_file(
-                    file_bytes, master_df, selected_sheets, dedupe_shipto=dedupe_shipto
-                )
-                st.session_state['last_sheets'] = sheets
-                st.session_state['last_report'] = report
-                st.session_state['last_unmatched'] = unmatched
-                st.session_state['last_ambiguous'] = ambiguous
-                st.session_state['last_unique_stops_sheets'] = unique_stops_sheets
-                st.session_state['last_filename'] = uploaded_file.name
-            except Exception as e:
-                st.error(f"เกิดข้อผิดพลาด: {e}")
-                st.exception(e)
+    uploaded_file = st.file_uploader("อัพโหลดไฟล์ route", type=['xls', 'xlsx'], label_visibility="collapsed")
 
-    if 'last_sheets' in st.session_state and st.session_state.get('last_filename') == uploaded_file.name:
-        sheets = st.session_state['last_sheets']
-        report = st.session_state['last_report']
-        unmatched = st.session_state['last_unmatched']
-        ambiguous = st.session_state.get('last_ambiguous', [])
-        unique_stops_sheets = st.session_state.get('last_unique_stops_sheets', {})
+    if uploaded_file is not None:
+        file_bytes = uploaded_file.read()
 
-        total_matched = sum(r['matched'] for r in report)
-        total_rows = sum(r['total'] for r in report)
-        match_rate = (total_matched / total_rows * 100) if total_rows else 0
+        try:
+            xl_peek = pd.ExcelFile(io.BytesIO(file_bytes))
+            all_sheet_names = xl_peek.sheet_names
+        except Exception as e:
+            st.error(f"เปิดไฟล์ไม่ได้: {e}")
+            st.stop()
 
-        card_class = "rcm-card-success" if match_rate >= 90 else "rcm-card-warn"
-        st.markdown(f"""
-        <div class="rcm-card {card_class}">
-            🎯 <b>เสร็จแล้ว!</b> จับคู่พิกัดได้ {total_matched:,} / {total_rows:,} แถว ({match_rate:.1f}%)
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown("##### 📑 เลือก Sheet ที่ต้องการประมวลผล")
+        sheet_cols = st.columns(min(len(all_sheet_names), 4))
+        selected_sheets = []
+        for i, sn in enumerate(all_sheet_names):
+            with sheet_cols[i % len(sheet_cols)]:
+                checked = st.checkbox(sn, value=True, key=f"sheet_{sn}")
+                if checked:
+                    selected_sheets.append(sn)
 
-        cols = st.columns(len(report))
-        for col, r in zip(cols, report):
-            with col:
-                if r['skipped']:
-                    stat_box(f"SHEET: {r['sheet']}", "ข้าม", "ไม่พบคอลัมน์ Cust Code")
-                else:
-                    stat_box(f"SHEET: {r['sheet']}", f"{r['matched']}/{r['total']}",
-                              f"SHIP-TO {r['via_ship']} · CODE {r['via_code']}")
+        if not selected_sheets:
+            st.warning("⚠️ กรุณาเลือกอย่างน้อย 1 Sheet เพื่อเริ่มประมวลผล")
+            st.stop()
 
-        st.markdown('<div class="rcm-glow-divider"></div>', unsafe_allow_html=True)
-
-        # --- Export format selection ---
-        st.markdown("##### 💾 เลือกฟอร์แมตไฟล์ผลลัพธ์")
-        export_format = st.radio(
-            "รูปแบบไฟล์",
-            options=["Excel (.xlsx)", "CSV (.csv)", "KML (.kml — เปิดใน Google Earth/Maps)"],
-            horizontal=True,
-            label_visibility="collapsed",
+        dedupe_shipto = st.checkbox(
+            "✨ ทำให้ Ship To Name ไม่ซ้ำกันอัตโนมัติ (เลือกแถวแรกที่เจอ)",
+            value=True,
+            help="เปิด (ค่าเริ่มต้น): ถ้าชื่อซ้ำกันในระบบ จะเลือกแถวแรกที่เจอมาใช้ทันที เร็ว แต่ถ้าเป็นเชนร้านที่มีหลายสาขาชื่อเดียวกัน (เช่น Big C) อาจได้พิกัดผิดสาขา\n\nปิด: ถ้าเจอชื่อซ้ำที่พิกัดขัดแย้งกันจริง (คนละสาขา) จะไม่เดา — ถือว่ายังไม่มีพิกัด แล้วแยกไปอยู่ลิสต์ 'ชื่อซ้ำ-ต้องตรวจสอบ' แทน ปลอดภัยกว่าแต่ match ได้น้อยลง",
         )
 
-        base_name = uploaded_file.name.rsplit('.', 1)[0]
-        dl_col1, dl_col2, dl_col3 = st.columns(3)
+        st.write("")
+        process_clicked = st.button("🚀 ประมวลผล Sheet ที่เลือก", type="primary", use_container_width=True)
 
-        with dl_col1:
-            if export_format.startswith("Excel"):
-                data_bytes = to_excel_bytes(sheets)
-                fname = f"{base_name}_with_coordinates.xlsx"
-                mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            elif export_format.startswith("CSV"):
-                data_bytes = to_csv_bytes(sheets)
-                fname = f"{base_name}_with_coordinates.csv"
-                mime = "text/csv"
-            else:
-                data_bytes = to_kml_bytes(sheets)
-                fname = f"{base_name}_with_coordinates.kml"
-                mime = "application/vnd.google-earth.kml+xml"
+        if process_clicked:
+            with st.spinner("🛰️ กำลังจับคู่พิกัด..."):
+                try:
+                    sheets, report, unmatched, ambiguous, unique_stops_sheets = process_route_file(
+                        file_bytes, master_df, selected_sheets, dedupe_shipto=dedupe_shipto
+                    )
+                    st.session_state['last_sheets'] = sheets
+                    st.session_state['last_report'] = report
+                    st.session_state['last_unmatched'] = unmatched
+                    st.session_state['last_ambiguous'] = ambiguous
+                    st.session_state['last_unique_stops_sheets'] = unique_stops_sheets
+                    st.session_state['last_filename'] = uploaded_file.name
+                except Exception as e:
+                    st.error(f"เกิดข้อผิดพลาด: {e}")
+                    st.exception(e)
 
-            st.download_button(
-                "⬇️ ดาวน์โหลดไฟล์พร้อมพิกัด",
-                data=data_bytes,
-                file_name=fname,
-                mime=mime,
-                use_container_width=True,
+        if 'last_sheets' in st.session_state and st.session_state.get('last_filename') == uploaded_file.name:
+            sheets = st.session_state['last_sheets']
+            report = st.session_state['last_report']
+            unmatched = st.session_state['last_unmatched']
+            ambiguous = st.session_state.get('last_ambiguous', [])
+            unique_stops_sheets = st.session_state.get('last_unique_stops_sheets', {})
+
+            total_matched = sum(r['matched'] for r in report)
+            total_rows = sum(r['total'] for r in report)
+            match_rate = (total_matched / total_rows * 100) if total_rows else 0
+
+            card_class = "rcm-card-success" if match_rate >= 90 else "rcm-card-warn"
+            st.markdown(f"""
+            <div class="rcm-card {card_class}">
+                🎯 <b>เสร็จแล้ว!</b> จับคู่พิกัดได้ {total_matched:,} / {total_rows:,} แถว ({match_rate:.1f}%)
+            </div>
+            """, unsafe_allow_html=True)
+
+            cols = st.columns(len(report))
+            for col, r in zip(cols, report):
+                with col:
+                    if r['skipped']:
+                        stat_box(f"SHEET: {r['sheet']}", "ข้าม", "ไม่พบคอลัมน์ Cust Code")
+                    else:
+                        stat_box(f"SHEET: {r['sheet']}", f"{r['matched']}/{r['total']}",
+                                  f"SHIP-TO {r['via_ship']} · CODE {r['via_code']}")
+
+            st.markdown('<div class="rcm-glow-divider"></div>', unsafe_allow_html=True)
+
+            # --- Export format selection ---
+            st.markdown("##### 💾 เลือกฟอร์แมตไฟล์ผลลัพธ์")
+            export_format = st.radio(
+                "รูปแบบไฟล์",
+                options=["Excel (.xlsx)", "CSV (.csv)", "KML (.kml — เปิดใน Google Earth/Maps)"],
+                horizontal=True,
+                label_visibility="collapsed",
             )
 
-        unmatched_df = pd.DataFrame(unmatched).drop_duplicates(subset=['Cust Code']) if unmatched else pd.DataFrame()
+            base_name = uploaded_file.name.rsplit('.', 1)[0]
+            dl_col1, dl_col2, dl_col3 = st.columns(3)
 
-        with dl_col2:
-            if not unmatched_df.empty:
-                unmatched_bytes = unmatched_to_excel_bytes(unmatched_df)
+            with dl_col1:
+                if export_format.startswith("Excel"):
+                    data_bytes = to_excel_bytes(sheets)
+                    fname = f"{base_name}_with_coordinates.xlsx"
+                    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                elif export_format.startswith("CSV"):
+                    data_bytes = to_csv_bytes(sheets)
+                    fname = f"{base_name}_with_coordinates.csv"
+                    mime = "text/csv"
+                else:
+                    data_bytes = to_kml_bytes(sheets)
+                    fname = f"{base_name}_with_coordinates.kml"
+                    mime = "application/vnd.google-earth.kml+xml"
+
                 st.download_button(
-                    f"📋 ดาวน์โหลดรายการที่ยังไม่มีพิกัด ({len(unmatched_df)})",
-                    data=unmatched_bytes,
-                    file_name=f"unmatched_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "⬇️ ดาวน์โหลดไฟล์พร้อมพิกัด",
+                    data=data_bytes,
+                    file_name=fname,
+                    mime=mime,
                     use_container_width=True,
                 )
-            else:
-                st.markdown("""
-                <div class="rcm-card rcm-card-success" style="text-align:center;">
-                    ✅ ไม่มีรายการตกหล่น — พิกัดครบทุกแถว
+
+            unmatched_df = pd.DataFrame(unmatched).drop_duplicates(subset=['Cust Code']) if unmatched else pd.DataFrame()
+
+            with dl_col2:
+                if not unmatched_df.empty:
+                    unmatched_bytes = unmatched_to_excel_bytes(unmatched_df)
+                    st.download_button(
+                        f"📋 ดาวน์โหลดรายการที่ยังไม่มีพิกัด ({len(unmatched_df)})",
+                        data=unmatched_bytes,
+                        file_name=f"unmatched_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                else:
+                    st.markdown("""
+                    <div class="rcm-card rcm-card-success" style="text-align:center;">
+                        ✅ ไม่มีรายการตกหล่น — พิกัดครบทุกแถว
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            with dl_col3:
+                total_unique_stops = sum(r.get('unique_stops', 0) for r in report)
+                if unique_stops_sheets and total_unique_stops > 0:
+                    stops_bytes = to_excel_bytes(unique_stops_sheets)
+                    st.download_button(
+                        f"📍 จุดส่งไม่ซ้ำ สำหรับ OptimoRoute ({total_unique_stops})",
+                        data=stops_bytes,
+                        file_name=f"{base_name}_unique_stops.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        help="คอลัมน์เหมือนไฟล์หลักทุกอย่าง เพิ่มแค่คอลัมน์ 'จำนวนออเดอร์รวม' — ยุบแถวที่พิกัดซ้ำกันให้เหลือ 1 แถวต่อ 1 จุด",
+                    )
+
+            if not unmatched_df.empty:
+                st.write("")
+                st.markdown(f"""
+                <div class="rcm-card rcm-card-warn">
+                    ⚠️ <b>มี {len(unmatched_df)} รายการที่ยังไม่มีพิกัด</b> — ใช้ไฟล์ที่ดาวน์โหลดด้านบนไปเพิ่มลงใน Master Data ได้เลย (ที่ Google Sheets โดยตรง)
                 </div>
                 """, unsafe_allow_html=True)
+                st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
 
-        with dl_col3:
-            total_unique_stops = sum(r.get('unique_stops', 0) for r in report)
-            if unique_stops_sheets and total_unique_stops > 0:
-                stops_bytes = to_excel_bytes(unique_stops_sheets)
+            ambiguous_df = pd.DataFrame(ambiguous).drop_duplicates(subset=['Cust Code']) if ambiguous else pd.DataFrame()
+            if not ambiguous_df.empty:
+                st.write("")
+                st.markdown(f"""
+                <div class="rcm-card rcm-card-warn">
+                    🔀 <b>พบ {len(ambiguous_df)} รายการที่ชื่อซ้ำในหลายสาขา (พิกัดขัดแย้งกัน)</b> —
+                    ระบบไม่กล้าเดาว่าเป็นสาขาไหน กรุณาเปิด Master Data แล้วแก้ Ship To Name ให้ระบุสาขาชัดเจน (เช่น เพิ่มชื่อสาขาต่อท้าย) แล้วลองประมวลผลใหม่
+                </div>
+                """, unsafe_allow_html=True)
+                st.dataframe(ambiguous_df, use_container_width=True, hide_index=True)
+                ambiguous_bytes = unmatched_to_excel_bytes(ambiguous_df)
                 st.download_button(
-                    f"📍 จุดส่งไม่ซ้ำ สำหรับ OptimoRoute ({total_unique_stops})",
-                    data=stops_bytes,
-                    file_name=f"{base_name}_unique_stops.xlsx",
+                    f"🔀 ดาวน์โหลดรายการชื่อซ้ำที่ต้องตรวจสอบ ({len(ambiguous_df)})",
+                    data=ambiguous_bytes,
+                    file_name=f"ambiguous_{datetime.now().strftime('%Y%m%d')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
-                    help="คอลัมน์เหมือนไฟล์หลักทุกอย่าง เพิ่มแค่คอลัมน์ 'จำนวนออเดอร์รวม' — ยุบแถวที่พิกัดซ้ำกันให้เหลือ 1 แถวต่อ 1 จุด",
                 )
 
-        if not unmatched_df.empty:
-            st.write("")
-            st.markdown(f"""
-            <div class="rcm-card rcm-card-warn">
-                ⚠️ <b>มี {len(unmatched_df)} รายการที่ยังไม่มีพิกัด</b> — ใช้ไฟล์ที่ดาวน์โหลดด้านบนไปเพิ่มลงใน Master Data ได้เลย (ที่ Google Sheets โดยตรง)
-            </div>
-            """, unsafe_allow_html=True)
-            st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
+    st.markdown('<div class="rcm-glow-divider"></div>', unsafe_allow_html=True)
+    st.caption(f"🛰️ Master Data sync (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} — รีเฟรชอัตโนมัติทุก 5 นาที หรือกด \"ซิงค์ตอนนี้\" ด้านบนเพื่อดึงข้อมูลล่าสุดทันที")
 
-        ambiguous_df = pd.DataFrame(ambiguous).drop_duplicates(subset=['Cust Code']) if ambiguous else pd.DataFrame()
-        if not ambiguous_df.empty:
-            st.write("")
-            st.markdown(f"""
-            <div class="rcm-card rcm-card-warn">
-                🔀 <b>พบ {len(ambiguous_df)} รายการที่ชื่อซ้ำในหลายสาขา (พิกัดขัดแย้งกัน)</b> —
-                ระบบไม่กล้าเดาว่าเป็นสาขาไหน กรุณาเปิด Master Data แล้วแก้ Ship To Name ให้ระบุสาขาชัดเจน (เช่น เพิ่มชื่อสาขาต่อท้าย) แล้วลองประมวลผลใหม่
-            </div>
-            """, unsafe_allow_html=True)
-            st.dataframe(ambiguous_df, use_container_width=True, hide_index=True)
-            ambiguous_bytes = unmatched_to_excel_bytes(ambiguous_df)
-            st.download_button(
-                f"🔀 ดาวน์โหลดรายการชื่อซ้ำที่ต้องตรวจสอบ ({len(ambiguous_df)})",
-                data=ambiguous_bytes,
-                file_name=f"ambiguous_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+with tab_product:
+    if not PRODUCT_SHEET_CSV_URL:
+        st.markdown("""
+        <div class="rcm-card rcm-card-warn">
+            ⚠️ <b>ยังไม่ได้ตั้งค่า PRODUCT_SHEET_CSV_URL</b><br>
+            เพิ่มใน Streamlit Secrets: <code>PRODUCT_SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/YOUR_ID/export?format=csv&gid=0"</code>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        try:
+            product_df = load_product_master(PRODUCT_SHEET_CSV_URL)
+            pstatus_col, psync_col = st.columns([5, 1])
+            with pstatus_col:
+                st.markdown(f"""
+                <div class="rcm-status-card">
+                    <div class="rcm-status-left">
+                        <div class="rcm-status-icon">✅</div>
+                        <div>
+                            <div class="rcm-status-title">เชื่อมต่อ Product Master สำเร็จ</div>
+                            <div class="rcm-status-sub">{len(product_df):,} รายการสินค้าในระบบ</div>
+                        </div>
+                    </div>
+                    <div class="rcm-status-right">
+                        <div class="rcm-status-right-icon">📦</div>
+                        <div class="rcm-status-pill"><span class="rcm-status-dot"></span>Connected</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            with psync_col:
+                st.markdown('<div class="rcm-sync-btn-wrap">', unsafe_allow_html=True)
+                if st.button("🔄 ซิงค์ตอนนี้", use_container_width=True, key="product_sync_btn",
+                             help="ดึงข้อมูล Product Master ล่าสุดจาก Google Sheets ทันที"):
+                    load_product_master.clear()
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+        except Exception as e:
+            st.error(f"โหลด Product Master ไม่สำเร็จ: {e}")
+            st.stop()
+
+        st.write("")
+        search_term = st.text_input(
+            "ค้นหาสินค้า", label_visibility="collapsed",
+            placeholder="🔍 ค้นหาด้วย SKUCode หรือชื่อสินค้า...",
+        )
+
+        display_cols = ['SKUCode', 'PRODUCT', 'BRAND', 'CATEGORY', 'UOM',
+                         'Pieces per Cases/Carton', 'Unit Net Wt (kg)',
+                         'Case Weight (kg)', 'Case Volume (CBM)', 'Status']
+        display_cols = [c for c in display_cols if c in product_df.columns]
+        display_df = product_df[display_cols]
+
+        if search_term:
+            mask = (
+                display_df['SKUCode'].astype(str).str.contains(search_term, case=False, na=False) |
+                display_df['PRODUCT'].astype(str).str.contains(search_term, case=False, na=False)
             )
+            display_df = display_df[mask]
 
-st.markdown('<div class="rcm-glow-divider"></div>', unsafe_allow_html=True)
-st.caption(f"🛰️ Master Data sync (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} — รีเฟรชอัตโนมัติทุก 5 นาที หรือกด \"ซิงค์ตอนนี้\" ด้านบนเพื่อดึงข้อมูลล่าสุดทันที")
+        st.dataframe(display_df, use_container_width=True, hide_index=True, height=460)
+        st.caption(f"แสดง {len(display_df):,} จาก {len(product_df):,} รายการทั้งหมด — เชื่อมกับไฟล์ route ยังไม่เปิดใช้งานในเฟสนี้")
