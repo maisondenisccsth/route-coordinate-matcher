@@ -576,6 +576,96 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
     return output_sheets, report, unmatched, ambiguous, unique_stops_sheets
 
 
+def process_weight_file(file_bytes, product_df, selected_sheets=None):
+    """เชื่อม Product Code (ไฟล์ route) กับ SKUCode (Product Master) เพื่อคำนวณน้ำหนักทีละแถว
+    เก็บคอลัมน์เดิมทั้งหมดไว้ครบ (เหมือนโหมดพิกัด) แค่เพิ่ม 'Weight (kg)' ต่อท้าย"""
+    xl = pd.ExcelFile(io.BytesIO(file_bytes))
+    output_sheets = {}
+    report = []
+    no_weight = []
+
+    weight_lookup = product_df.dropna(subset=['SKUCode']).drop_duplicates('SKUCode').set_index('SKUCode')
+
+    sheet_list = selected_sheets if selected_sheets is not None else xl.sheet_names
+
+    for sheet_name in sheet_list:
+        raw = xl.parse(sheet_name, header=None).values.tolist()
+        header_row, product_col = find_header_row(raw, ['product code'])
+
+        if header_row is None:
+            output_sheets[sheet_name] = xl.parse(sheet_name, header=None)
+            report.append({'sheet': sheet_name, 'skipped': True, 'calculated': 0, 'total': 0})
+            continue
+
+        header = raw[header_row]
+        qty_col = None
+        units_col = None
+        for i, v in enumerate(header):
+            if isinstance(v, str) and v.strip().lower() == 'qty':
+                qty_col = i
+            if isinstance(v, str) and v.strip().lower() == 'units':
+                units_col = i
+
+        out_rows = []
+        calculated = total = 0
+
+        for r, row in enumerate(raw):
+            if r < header_row:
+                out_rows.append(row)
+                continue
+            if r == header_row:
+                out_rows.append(list(row) + ['Weight (kg)'])
+                continue
+
+            product_val = row[product_col] if product_col < len(row) else None
+            if product_val is None or (isinstance(product_val, float) and pd.isna(product_val)) or str(product_val).strip() == '':
+                continue  # แถวว่าง/spacer -> ข้ามไปเลย เหมือนโหมดพิกัด
+
+            code = str(product_val).strip()
+            total += 1
+            qty_val = row[qty_col] if (qty_col is not None and qty_col < len(row)) else None
+            units_val = row[units_col] if (units_col is not None and units_col < len(row)) else None
+            units_str = str(units_val).strip().upper() if units_val is not None and not (isinstance(units_val, float) and pd.isna(units_val)) else ''
+
+            weight = None
+            reason = None
+
+            if code not in weight_lookup.index:
+                reason = 'ไม่พบ Product Code นี้ใน Product Master'
+            elif qty_val is None or (isinstance(qty_val, float) and pd.isna(qty_val)):
+                reason = 'ไม่มีค่า Qty ในแถวนี้'
+            elif units_str == 'PCS':
+                unit_wt = weight_lookup.loc[code, 'Unit Net Wt (kg)']
+                if hasattr(unit_wt, 'iloc'):
+                    unit_wt = unit_wt.iloc[0]
+                if pd.isna(unit_wt):
+                    reason = 'มี Product Code แต่ Product Master ยังไม่มีข้อมูลน้ำหนัก (Unit Net Wt)'
+                else:
+                    weight = float(qty_val) * float(unit_wt)
+            elif units_str == 'KG':
+                weight = float(qty_val)  # Qty เป็นน้ำหนักอยู่แล้ว ไม่ต้องคูณ
+            else:
+                reason = f'หน่วย (Units) "{units_val}" ยังไม่รองรับการคำนวณอัตโนมัติ'
+
+            new_row = list(row) + [weight]
+            if weight is not None:
+                calculated += 1
+            else:
+                no_weight.append({
+                    'Product Code': code,
+                    'Qty': qty_val,
+                    'Units': units_val if units_val is not None else '',
+                    'Sheet': sheet_name,
+                    'สาเหตุ': reason,
+                })
+            out_rows.append(new_row)
+
+        output_sheets[sheet_name] = pd.DataFrame(out_rows)
+        report.append({'sheet': sheet_name, 'skipped': False, 'calculated': calculated, 'total': total})
+
+    return output_sheets, report, no_weight
+
+
 def to_excel_bytes(sheets_dict):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -1003,4 +1093,118 @@ with tab_product:
             display_df = display_df[mask]
 
         st.dataframe(display_df, use_container_width=True, hide_index=True, height=460)
-        st.caption(f"แสดง {len(display_df):,} จาก {len(product_df):,} รายการทั้งหมด — เชื่อมกับไฟล์ route ยังไม่เปิดใช้งานในเฟสนี้")
+        st.caption(f"แสดง {len(display_df):,} จาก {len(product_df):,} รายการทั้งหมด")
+
+        st.markdown('<div class="rcm-glow-divider"></div>', unsafe_allow_html=True)
+        st.markdown("##### ⚖️ คำนวณน้ำหนักจากไฟล์ route")
+        st.caption("โยนไฟล์ route เข้ามา ระบบจะเชื่อม Product Code กับ Product Master แล้วเติมคอลัมน์น้ำหนักท้ายทุกแถว (คอลัมน์เดิมครบเหมือนไฟล์ต้นฉบับ)")
+
+        weight_file = st.file_uploader(
+            "อัพโหลดไฟล์ route สำหรับคำนวณน้ำหนัก", type=['xls', 'xlsx'],
+            label_visibility="collapsed", key="weight_file_uploader",
+        )
+
+        if weight_file is not None:
+            wfile_bytes = weight_file.read()
+            try:
+                wxl_peek = pd.ExcelFile(io.BytesIO(wfile_bytes))
+                w_sheet_names = wxl_peek.sheet_names
+            except Exception as e:
+                st.error(f"เปิดไฟล์ไม่ได้: {e}")
+                st.stop()
+
+            st.write("")
+            wsheet_cols = st.columns(min(len(w_sheet_names), 4))
+            w_selected_sheets = []
+            for i, sn in enumerate(w_sheet_names):
+                with wsheet_cols[i % len(wsheet_cols)]:
+                    checked = st.checkbox(sn, value=True, key=f"wsheet_{sn}")
+                    if checked:
+                        w_selected_sheets.append(sn)
+
+            if not w_selected_sheets:
+                st.warning("⚠️ กรุณาเลือกอย่างน้อย 1 Sheet เพื่อเริ่มประมวลผล")
+                st.stop()
+
+            st.write("")
+            weight_process_clicked = st.button("⚖️ คำนวณน้ำหนัก", type="primary", use_container_width=True, key="weight_process_btn")
+
+            if weight_process_clicked:
+                with st.spinner("⚖️ กำลังคำนวณน้ำหนัก..."):
+                    try:
+                        w_sheets, w_report, w_no_weight = process_weight_file(wfile_bytes, product_df, w_selected_sheets)
+                        st.session_state['last_w_sheets'] = w_sheets
+                        st.session_state['last_w_report'] = w_report
+                        st.session_state['last_w_no_weight'] = w_no_weight
+                        st.session_state['last_w_filename'] = weight_file.name
+                    except Exception as e:
+                        st.error(f"เกิดข้อผิดพลาด: {e}")
+                        st.exception(e)
+
+            if 'last_w_sheets' in st.session_state and st.session_state.get('last_w_filename') == weight_file.name:
+                w_sheets = st.session_state['last_w_sheets']
+                w_report = st.session_state['last_w_report']
+                w_no_weight = st.session_state['last_w_no_weight']
+
+                w_total_calc = sum(r['calculated'] for r in w_report)
+                w_total_rows = sum(r['total'] for r in w_report)
+                w_rate = (w_total_calc / w_total_rows * 100) if w_total_rows else 0
+
+                w_card_class = "rcm-card-success" if w_rate >= 90 else "rcm-card-warn"
+                st.markdown(f"""
+                <div class="rcm-card {w_card_class}">
+                    ⚖️ <b>เสร็จแล้ว!</b> คำนวณน้ำหนักได้ {w_total_calc:,} / {w_total_rows:,} แถว ({w_rate:.1f}%)
+                </div>
+                """, unsafe_allow_html=True)
+
+                w_cols = st.columns(len(w_report))
+                for col, r in zip(w_cols, w_report):
+                    with col:
+                        if r['skipped']:
+                            stat_box(f"SHEET: {r['sheet']}", "ข้าม", "ไม่พบคอลัมน์ Product Code")
+                        else:
+                            stat_box(f"SHEET: {r['sheet']}", f"{r['calculated']}/{r['total']}", "คำนวณสำเร็จ")
+
+                st.write("")
+                w_dl_col1, w_dl_col2 = st.columns(2)
+                w_base_name = weight_file.name.rsplit('.', 1)[0]
+
+                with w_dl_col1:
+                    w_output_bytes = to_excel_bytes(w_sheets)
+                    st.download_button(
+                        "⬇️ ดาวน์โหลดไฟล์พร้อมน้ำหนัก",
+                        data=w_output_bytes,
+                        file_name=f"{w_base_name}_with_weight.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="weight_download_main",
+                    )
+
+                w_no_weight_df = pd.DataFrame(w_no_weight).drop_duplicates(subset=['Product Code', 'สาเหตุ']) if w_no_weight else pd.DataFrame()
+
+                with w_dl_col2:
+                    if not w_no_weight_df.empty:
+                        w_nw_bytes = unmatched_to_excel_bytes(w_no_weight_df)
+                        st.download_button(
+                            f"📋 รายการที่ยังไม่มีน้ำหนัก ({len(w_no_weight_df)})",
+                            data=w_nw_bytes,
+                            file_name=f"no_weight_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="weight_download_missing",
+                        )
+                    else:
+                        st.markdown("""
+                        <div class="rcm-card rcm-card-success" style="text-align:center;">
+                            ✅ คำนวณน้ำหนักได้ครบทุกแถว
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                if not w_no_weight_df.empty:
+                    st.write("")
+                    st.markdown(f"""
+                    <div class="rcm-card rcm-card-warn">
+                        ⚠️ <b>มี {len(w_no_weight_df)} รายการที่ยังคำนวณน้ำหนักไม่ได้</b> — ดูคอลัมน์ "สาเหตุ" เพื่อรู้ว่าต้องแก้อะไร (ส่วนใหญ่คือ Product Master ยังไม่มีข้อมูลน้ำหนักของ SKU นั้น)
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.dataframe(w_no_weight_df, use_container_width=True, hide_index=True)
