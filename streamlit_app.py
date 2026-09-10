@@ -11,6 +11,7 @@ import pandas as pd
 import io
 import re
 from datetime import datetime
+from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="Route Coordinate Matcher", page_icon="🚚", layout="wide")
 
@@ -668,11 +669,39 @@ def process_weight_file(file_bytes, product_df, selected_sheets=None):
     return output_sheets, report, no_weight
 
 
+def _is_blank(v):
+    if v is None:
+        return True
+    if isinstance(v, float) and pd.isna(v):
+        return True
+    if isinstance(v, str) and v.strip() == '':
+        return True
+    return False
+
+
+def _drop_empty_columns(df):
+    """ลบคอลัมน์ที่ว่างเปล่าทุกแถว (ทั้ง header และข้อมูล) เช่นคอลัมน์ spacer ระหว่างคอลัมน์จริงในไฟล์ route ต้นฉบับ"""
+    keep_cols = [c for c in df.columns if not df[c].apply(_is_blank).all()]
+    if not keep_cols:  # กันเคส edge case ที่ทุกคอลัมน์ว่างหมด (ไม่ควรเกิดขึ้นจริง)
+        return df
+    return df[keep_cols].reset_index(drop=True)
+
+
 def to_excel_bytes(sheets_dict):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         for name, df in sheets_dict.items():
-            df.to_excel(writer, sheet_name=name[:31], header=False, index=False)
+            df_clean = _drop_empty_columns(df)
+            df_clean.to_excel(writer, sheet_name=name[:31], header=False, index=False)
+            ws = writer.sheets[name[:31]]
+            # ปรับความกว้างคอลัมน์ให้พอดีกับตัวอักษรที่ยาวที่สุดในคอลัมน์นั้น (openpyxl ไม่มี autofit ในตัว จำลองเอง)
+            for col_idx in range(df_clean.shape[1]):
+                max_len = 0
+                for val in df_clean.iloc[:, col_idx]:
+                    if not _is_blank(val):
+                        max_len = max(max_len, len(str(val)))
+                col_letter = get_column_letter(col_idx + 1)
+                ws.column_dimensions[col_letter].width = min(max(max_len + 2, 8), 60)
     return output.getvalue()
 
 
