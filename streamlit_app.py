@@ -619,7 +619,9 @@ def process_weight_file(file_bytes, product_df, selected_sheets=None):
 
             product_val = row[product_col] if product_col < len(row) else None
             if product_val is None or (isinstance(product_val, float) and pd.isna(product_val)) or str(product_val).strip() == '':
-                continue  # แถวว่าง/spacer -> ข้ามไปเลย เหมือนโหมดพิกัด
+                # ไม่มี Product Code -> ยังคงเก็บแถวนี้ไว้เหมือนเดิม (ห้ามลบทิ้งเงียบๆ) แค่ไม่มีน้ำหนักให้คำนวณ
+                out_rows.append(list(row) + [None])
+                continue
 
             code = str(product_val).strip()
             total += 1
