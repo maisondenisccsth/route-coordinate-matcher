@@ -431,6 +431,11 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
         raw = xl.parse(sheet_name, header=None).values.tolist()
         header_row, cust_col = find_header_row(raw, ['cust code', 'cust id'])
 
+        # ถ้าไม่เจอ Cust Code/ID เลย ลองหาคอลัมน์ทางเลือก (ไฟล์บางแบบ เช่น export สไตล์ invoice
+        # ของโซนภูเก็ต/สมุย ไม่มีคอลัมน์ Cust Code เลย มีแต่ Cust. Name)
+        if header_row is None:
+            header_row, cust_col = find_header_row(raw, ['cust. name', 'cust name', 'cust.name'])
+
         if header_row is None:
             output_sheets[sheet_name] = xl.parse(sheet_name, header=None)
             report.append({'sheet': sheet_name, 'skipped': True, 'matched': 0, 'total': 0})
@@ -442,6 +447,13 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
             if isinstance(v, str) and 'ship' in v.lower() and 'name' in v.lower():
                 ship_col = i
                 break
+        # ถ้าไม่เจอคอลัมน์ชื่อ "...ship...name..." ลองหา "Ship To" เฉยๆ (ไม่มีคำว่า name ต่อท้าย)
+        # เผื่อไฟล์ตั้งชื่อคอลัมน์แบบนี้ (เจอในไฟล์ export บางโซน)
+        if ship_col is None:
+            for i, v in enumerate(header):
+                if isinstance(v, str) and v.strip().lower() == 'ship to':
+                    ship_col = i
+                    break
 
         # ถ้าไม่มีคอลัมน์ ShipTo Name ในชีทนี้เลย ให้ใช้ Cust Name (หรือคอลัมน์ชื่ออื่นที่ใกล้เคียง) แทน
         name_fallback_col = None
