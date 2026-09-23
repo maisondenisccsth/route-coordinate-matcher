@@ -12,6 +12,7 @@ import io
 import re
 from datetime import datetime
 from openpyxl.utils import get_column_letter
+import qrcode
 
 st.set_page_config(page_title="Route Coordinate Matcher", page_icon="🚚", layout="wide")
 
@@ -844,7 +845,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-tab_process, tab_product = st.tabs(["📤  ประมวลผลไฟล์", "📦  Product Master"])
+tab_process, tab_product, tab_qr = st.tabs(["📤  ประมวลผลไฟล์", "📦  Product Master", "🔗  QR Code"])
 
 with tab_process:
     if not MASTER_SHEET_CSV_URL:
@@ -1251,3 +1252,76 @@ with tab_product:
                     </div>
                     """, unsafe_allow_html=True)
                     st.dataframe(w_no_weight_df, use_container_width=True, hide_index=True)
+
+
+# ============================================================
+# TAB 3: QR CODE GENERATOR
+# ============================================================
+def generate_qr_bytes(link, box_size=10, border=4, fill_color='#000000', back_color='#FFFFFF'):
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=box_size,
+        border=border,
+    )
+    qr.add_data(link)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color=fill_color, back_color=back_color).convert('RGB')
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue(), img.size
+
+
+with tab_qr:
+    st.markdown("##### 🔗 สร้าง QR Code จากลิงก์")
+    st.caption("ใส่ลิงก์อะไรก็ได้ — ลิงก์แอป, Google Sheets, เอกสาร ฯลฯ — ได้ QR Code กลับมาดาวน์โหลดได้ทันที")
+
+    qr_link = st.text_input(
+        "ลิงก์", label_visibility="collapsed",
+        placeholder="https://example.com",
+        key="qr_link_input",
+    )
+
+    with st.expander("⚙️ ปรับแต่ง (ไม่บังคับ)"):
+        qc1, qc2 = st.columns(2)
+        with qc1:
+            qr_size = st.slider("ขนาด QR Code", min_value=5, max_value=20, value=10, key="qr_size")
+            qr_fill = st.color_picker("สีลาย", value="#000000", key="qr_fill")
+        with qc2:
+            qr_border = st.slider("ขอบขาว (border)", min_value=1, max_value=10, value=4, key="qr_border")
+            qr_back = st.color_picker("สีพื้นหลัง", value="#FFFFFF", key="qr_back")
+
+    if qr_link and qr_link.strip():
+        try:
+            qr_bytes, qr_dims = generate_qr_bytes(
+                qr_link.strip(),
+                box_size=qr_size, border=qr_border,
+                fill_color=qr_fill, back_color=qr_back,
+            )
+            st.write("")
+            qr_img_col, qr_info_col = st.columns([1, 1])
+            with qr_img_col:
+                st.image(qr_bytes, width=280)
+            with qr_info_col:
+                st.markdown(f"""
+                <div class="rcm-card rcm-card-success">
+                    ✅ <b>สร้าง QR Code สำเร็จ</b>
+                    <div class="rcm-status-sub" style="margin-top:6px;">ขนาดภาพ: {qr_dims[0]}×{qr_dims[1]} px</div>
+                </div>
+                """, unsafe_allow_html=True)
+                st.download_button(
+                    "⬇️ ดาวน์โหลด QR Code (PNG)",
+                    data=qr_bytes,
+                    file_name="qrcode.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    key="qr_download_btn",
+                )
+        except Exception as e:
+            st.error(f"สร้าง QR Code ไม่สำเร็จ: {e}")
+    else:
+        st.markdown("""
+        <div class="rcm-card" style="text-align:center; color:#6B84A6;">
+            📎 ใส่ลิงก์ด้านบนเพื่อเริ่มสร้าง QR Code
+        </div>
+        """, unsafe_allow_html=True)
