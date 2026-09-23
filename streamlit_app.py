@@ -10,8 +10,12 @@ import streamlit as st
 import pandas as pd
 import io
 import re
+import xlrd
 from datetime import datetime
+from openpyxl import load_workbook, Workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 import qrcode
 
 st.set_page_config(page_title="Route Coordinate Matcher", page_icon="🚚", layout="wide")
@@ -1272,6 +1276,291 @@ def generate_qr_bytes(link, box_size=10, border=4, fill_color='#000000', back_co
     return buf.getvalue(), img.size
 
 
+# ---- Batch mode: read links straight out of an uploaded file, embed a QR per row ----
+QR_URL_RE = re.compile(r'https?://\S+')
+
+
+def find_link_column(sheet_rows):
+    """sheet_rows: list of row tuples (raw cell values, 0-indexed).
+    Scans every cell (content, not header text) and returns the 0-based column
+    index with the most URL-looking values — or None if the sheet has none.
+    Content-based on purpose: header names for a maps-link column vary a lot
+    between files ('Ship to Google Plus code (Epicor)', 'ที่ตั้ง', a column with
+    no header at all, ...), so we trust what's actually in the cells."""
+    counts = {}
+    for row in sheet_rows:
+        for i, v in enumerate(row):
+            if isinstance(v, str) and QR_URL_RE.search(v):
+                counts[i] = counts.get(i, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
+def _embed_qr_column(ws, raw_rows, link_col, start_col0, box_size=5, border=2):
+    """Appends a 'QR Code' column at 0-based column index start_col0, embedding
+    a QR image at NATIVE resolution (no shrinking) for every row whose link_col
+    cell contains a link — long multi-stop Google Maps links need a fairly
+    dense/large QR to stay scannable, so images are never downscaled to a fixed
+    thumbnail. Never touches any other existing cell. Returns qr_count."""
+    new_col_letter = get_column_letter(start_col0 + 1)
+    ws.cell(row=1, column=start_col0 + 1, value="QR Code")
+
+    qr_count = 0
+    max_w_px = 0
+    for r_idx, row in enumerate(raw_rows):
+        v = row[link_col] if link_col < len(row) else None
+        if not isinstance(v, str):
+            continue
+        m = QR_URL_RE.search(v)
+        if not m:
+            continue
+        try:
+            qr_bytes, (w_px, h_px) = generate_qr_bytes(m.group(0), box_size=box_size, border=border)
+        except Exception:
+            continue
+        img = XLImage(io.BytesIO(qr_bytes))
+        excel_row = r_idx + 1  # 1-indexed
+        ws.add_image(img, f"{new_col_letter}{excel_row}")
+        target_h = h_px * 0.75 + 4  # px -> pt, + a little padding
+        current_h = ws.row_dimensions[excel_row].height
+        if not current_h or current_h < target_h:
+            ws.row_dimensions[excel_row].height = target_h
+        max_w_px = max(max_w_px, w_px)
+        qr_count += 1
+
+    if qr_count:
+        ws.column_dimensions[new_col_letter].width = max(12, max_w_px / 7 + 2)
+
+    return qr_count
+
+
+# ---- "Keep template": preserve original .xls formatting (font, fill, border,
+# column widths, row heights, merged cells) when rebuilding a legacy .xls into
+# .xlsx, instead of a bare values-only rebuild. Only needed for the .xls
+# fallback — real .xlsx already keeps 100% of its original formatting since
+# that path edits the loaded workbook in place. ----
+_QR_BORDER_STYLE_MAP = {
+    0: None, 1: 'thin', 2: 'medium', 3: 'dashed', 4: 'dotted',
+    5: 'thick', 6: 'double', 7: 'hair', 8: 'mediumDashed',
+    9: 'dashDot', 10: 'mediumDashDot', 11: 'dashDotDot',
+    12: 'mediumDashDotDot', 13: 'slantDashDot',
+}
+_QR_HALIGN_MAP = {1: 'left', 2: 'center', 3: 'right', 4: 'fill', 5: 'justify', 6: 'centerContinuous'}
+_QR_VALIGN_MAP = {0: 'top', 1: 'center', 2: 'bottom', 3: 'justify'}
+
+
+def _xlrd_color_hex(color_map, idx):
+    """xlrd colour index -> 'RRGGBB' hex, or None for an 'automatic/default'
+    color (index not in the palette — leave openpyxl's own default alone)."""
+    if idx is None:
+        return None
+    rgb = color_map.get(idx)
+    return ('%02X%02X%02X' % rgb) if rgb else None
+
+
+def _xlrd_border_side(style_code, colour_idx, color_map):
+    if not style_code:
+        return Side(style=None)
+    style = _QR_BORDER_STYLE_MAP.get(style_code, 'thin')
+    color_hex = _xlrd_color_hex(color_map, colour_idx)
+    return Side(style=style, color=color_hex) if color_hex else Side(style=style)
+
+
+def _build_openpyxl_style_from_xf(xf, font_rec, color_map):
+    """One xlrd XF (+ its font) record -> (Font, PatternFill, Border, Alignment)."""
+    font = Font(
+        name=font_rec.name or 'Calibri',
+        size=(font_rec.height / 20.0) if font_rec.height else 11,
+        bold=bool(font_rec.bold),
+        italic=bool(font_rec.italic),
+        color=_xlrd_color_hex(color_map, font_rec.colour_index),
+    )
+    fill = PatternFill()
+    if getattr(xf.background, 'fill_pattern', 0):
+        bg_hex = _xlrd_color_hex(color_map, xf.background.pattern_colour_index)
+        if bg_hex:
+            fill = PatternFill(fill_type='solid', fgColor=bg_hex)
+    border = Border(
+        top=_xlrd_border_side(xf.border.top_line_style, xf.border.top_colour_index, color_map),
+        bottom=_xlrd_border_side(xf.border.bottom_line_style, xf.border.bottom_colour_index, color_map),
+        left=_xlrd_border_side(xf.border.left_line_style, xf.border.left_colour_index, color_map),
+        right=_xlrd_border_side(xf.border.right_line_style, xf.border.right_colour_index, color_map),
+    )
+    alignment = Alignment(
+        horizontal=_QR_HALIGN_MAP.get(xf.alignment.hor_align),
+        vertical=_QR_VALIGN_MAP.get(xf.alignment.vert_align),
+        wrap_text=bool(getattr(xf.alignment, 'wrap', False)),
+    )
+    return font, fill, border, alignment
+
+
+def _apply_xls_styles(ws, sh, xlrd_book, n_rows, n_cols):
+    """Layers font/fill/border/alignment + column widths + row heights +
+    merged cells from an xlrd(formatting_info=True) sheet onto an already
+    value-populated openpyxl worksheet ws — bounded to [0,n_rows)x[0,n_cols),
+    the same real-data bounds pandas already determined. That bound matters:
+    some real CCS .xls exports report tens of thousands of blank padding rows
+    at the raw-file level (e.g. a stray format applied far past the real data)
+    — capping the loop at pandas' trimmed shape keeps this fast and correct
+    regardless of what the raw file claims."""
+    color_map = xlrd_book.colour_map
+    xf_list = xlrd_book.xf_list
+    font_list = xlrd_book.font_list
+    style_cache = {}
+
+    r_bound = min(n_rows, sh.nrows)
+    c_bound = min(n_cols, sh.ncols)
+
+    for r in range(r_bound):
+        for c in range(c_bound):
+            try:
+                xf_index = sh.cell_xf_index(r, c)
+            except IndexError:
+                continue
+            if xf_index not in style_cache:
+                try:
+                    xf = xf_list[xf_index]
+                    font_rec = font_list[xf.font_index]
+                    style_cache[xf_index] = _build_openpyxl_style_from_xf(xf, font_rec, color_map)
+                except Exception:
+                    style_cache[xf_index] = None
+            style = style_cache[xf_index]
+            if style is None:
+                continue
+            font, fill, border, alignment = style
+            wc = ws.cell(row=r + 1, column=c + 1)
+            wc.font = font
+            wc.fill = fill
+            wc.border = border
+            wc.alignment = alignment
+
+    for c in range(c_bound):
+        ci = sh.colinfo_map.get(c)
+        if ci and ci.width:
+            ws.column_dimensions[get_column_letter(c + 1)].width = ci.width / 256.0
+
+    for r in range(r_bound):
+        ri = sh.rowinfo_map.get(r)
+        if ri and ri.height:
+            ws.row_dimensions[r + 1].height = ri.height / 20.0
+
+    for (rlo, rhi, clo, chi) in sh.merged_cells:
+        if rlo < r_bound and clo < c_bound:
+            try:
+                ws.merge_cells(start_row=rlo + 1, end_row=min(rhi, r_bound),
+                                start_column=clo + 1, end_column=min(chi, c_bound))
+            except Exception:
+                pass
+
+
+def process_qr_batch_file(file_bytes, selected_sheets=None, box_size=5, border=2):
+    """
+    Scans each selected sheet for a column containing links and returns a NEW
+    workbook (bytes) with a 'QR Code' column appended to every sheet that has
+    one — one embedded, natively-scannable QR image per row with a link.
+
+    Never alters or removes any existing cell — pure append. A sheet with no
+    detected link is left completely untouched (not even a header added).
+
+    Returns (output_bytes, report): report is a list of dicts per sheet —
+    {'sheet', 'link_col_letter' (or None), 'qr_count', 'total_rows'}.
+    """
+    xl = pd.ExcelFile(io.BytesIO(file_bytes))
+    all_sheet_names = xl.sheet_names
+    sheets_to_process = selected_sheets if selected_sheets else all_sheet_names
+
+    # High-fidelity path: real .xlsx loads straight into openpyxl, so every
+    # other sheet, style, formula and column is preserved byte-for-byte and we
+    # only ever append the new column. Legacy .xls can't be loaded (or written)
+    # by openpyxl, so it falls back to a values-only rebuild — same as the rest
+    # of this app already does for .xls uploads.
+    try:
+        out_wb = load_workbook(io.BytesIO(file_bytes))
+        native = True
+    except Exception:
+        out_wb = None
+        native = False
+
+    report = []
+
+    if native:
+        for sn in sheets_to_process:
+            if sn not in out_wb.sheetnames:
+                continue
+            ws = out_wb[sn]
+            raw_rows = list(ws.iter_rows(values_only=True))
+            link_col = find_link_column(raw_rows)
+
+            if link_col is None:
+                report.append({'sheet': sn, 'link_col_letter': None, 'qr_count': 0, 'total_rows': len(raw_rows)})
+                continue
+
+            qr_count = _embed_qr_column(ws, raw_rows, link_col, ws.max_column, box_size, border)
+            report.append({
+                'sheet': sn,
+                'link_col_letter': get_column_letter(link_col + 1),
+                'qr_count': qr_count,
+                'total_rows': len(raw_rows),
+            })
+
+        buf = io.BytesIO()
+        out_wb.save(buf)
+        return buf.getvalue(), report
+
+    else:
+        # Legacy .xls: values still come from the same pandas path as before
+        # (unchanged — already trims fake padding ranges and handles date/time
+        # cells correctly). "Keep template": layer the original font/fill/
+        # border/column-width/merge formatting back on top via a separate
+        # xlrd(formatting_info=True) pass. If that pass fails for any reason,
+        # degrade silently to the old values-only look rather than breaking
+        # the actual QR feature over a styling problem.
+        try:
+            xlrd_book = xlrd.open_workbook(file_contents=file_bytes, formatting_info=True)
+        except Exception:
+            xlrd_book = None
+
+        out_wb = Workbook()
+        out_wb.remove(out_wb.active)
+
+        for sn in sheets_to_process:
+            if sn not in all_sheet_names:
+                continue
+            df_raw = pd.read_excel(xl, sheet_name=sn, header=None)
+            raw_rows = df_raw.values.tolist()
+
+            ws = out_wb.create_sheet(title=sn[:31])
+            for r_idx, row in enumerate(raw_rows):
+                for c_idx, v in enumerate(row):
+                    if pd.isna(v):
+                        continue
+                    ws.cell(row=r_idx + 1, column=c_idx + 1, value=v)
+
+            if xlrd_book is not None:
+                try:
+                    _apply_xls_styles(ws, xlrd_book.sheet_by_name(sn), xlrd_book, df_raw.shape[0], df_raw.shape[1])
+                except Exception:
+                    pass
+
+            link_col = find_link_column(raw_rows)
+            if link_col is None:
+                report.append({'sheet': sn, 'link_col_letter': None, 'qr_count': 0, 'total_rows': len(raw_rows)})
+                continue
+
+            qr_count = _embed_qr_column(ws, raw_rows, link_col, df_raw.shape[1], box_size, border)
+            report.append({
+                'sheet': sn,
+                'link_col_letter': get_column_letter(link_col + 1),
+                'qr_count': qr_count,
+                'total_rows': len(raw_rows),
+            })
+
+        buf = io.BytesIO()
+        out_wb.save(buf)
+        return buf.getvalue(), report
+
+
 with tab_qr:
     st.markdown("##### 🔗 สร้าง QR Code จากลิงก์")
     st.caption("ใส่ลิงก์อะไรก็ได้ — ลิงก์แอป, Google Sheets, เอกสาร ฯลฯ — ได้ QR Code กลับมาดาวน์โหลดได้ทันที")
@@ -1325,3 +1614,88 @@ with tab_qr:
             📎 ใส่ลิงก์ด้านบนเพื่อเริ่มสร้าง QR Code
         </div>
         """, unsafe_allow_html=True)
+
+    st.markdown('<div class="rcm-glow-divider"></div>', unsafe_allow_html=True)
+
+    # ============================================================
+    # BATCH: อ่านลิงก์จากไฟล์ที่อัพโหลด → ได้ไฟล์เดิมที่ฝัง QR Code กลับมา
+    # ============================================================
+    st.markdown("##### 📁 สร้าง QR Code จากไฟล์ (Batch)")
+    st.caption("อัพโหลดไฟล์ที่มีลิงก์ Google Maps อยู่แล้ว (เช่นไฟล์ route ที่มีลิงก์เส้นทางท้ายชีท หรือ Master Data ที่มีลิงก์ต่อแถว) ระบบจะหาคอลัมน์ที่มีลิงก์ให้เอง แล้วฝัง QR Code กลับเข้าไปในคอลัมน์ใหม่ท้ายไฟล์ — ข้อมูลเดิมไม่ถูกแก้หรือลบแม้แต่แถวเดียว")
+
+    qr_file = st.file_uploader("อัพโหลดไฟล์", type=['xls', 'xlsx'], label_visibility="collapsed", key="qr_batch_uploader")
+
+    if qr_file is not None:
+        qr_file_bytes = qr_file.read()
+
+        try:
+            qr_xl_peek = pd.ExcelFile(io.BytesIO(qr_file_bytes))
+            qr_all_sheet_names = qr_xl_peek.sheet_names
+        except Exception as e:
+            st.error(f"เปิดไฟล์ไม่ได้: {e}")
+            st.stop()
+
+        st.markdown("###### 📑 เลือก Sheet ที่ต้องการสแกนหาลิงก์")
+        qr_sheet_cols = st.columns(min(len(qr_all_sheet_names), 4))
+        qr_selected_sheets = []
+        for i, sn in enumerate(qr_all_sheet_names):
+            with qr_sheet_cols[i % len(qr_sheet_cols)]:
+                checked = st.checkbox(sn, value=True, key=f"qrbatch_sheet_{sn}")
+                if checked:
+                    qr_selected_sheets.append(sn)
+
+        if not qr_selected_sheets:
+            st.warning("⚠️ กรุณาเลือกอย่างน้อย 1 Sheet")
+            st.stop()
+
+        st.write("")
+        qr_batch_clicked = st.button("🔍 สแกนหาลิงก์ + สร้าง QR Code", type="primary", use_container_width=True, key="qr_batch_btn")
+
+        if qr_batch_clicked:
+            with st.spinner("🔍 กำลังสแกนหาลิงก์และสร้าง QR Code..."):
+                try:
+                    qr_out_bytes, qr_report = process_qr_batch_file(qr_file_bytes, qr_selected_sheets)
+                    st.session_state['last_qr_batch_bytes'] = qr_out_bytes
+                    st.session_state['last_qr_batch_report'] = qr_report
+                    st.session_state['last_qr_batch_filename'] = qr_file.name
+                except Exception as e:
+                    st.error(f"เกิดข้อผิดพลาด: {e}")
+                    st.exception(e)
+
+        if 'last_qr_batch_report' in st.session_state and st.session_state.get('last_qr_batch_filename') == qr_file.name:
+            qr_report = st.session_state['last_qr_batch_report']
+            qr_out_bytes = st.session_state['last_qr_batch_bytes']
+            total_qr = sum(r['qr_count'] for r in qr_report)
+
+            if total_qr > 0:
+                st.markdown(f"""
+                <div class="rcm-card rcm-card-success">
+                    🎉 <b>เสร็จแล้ว!</b> สร้าง QR Code ได้ {total_qr:,} อัน
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div class="rcm-card rcm-card-warn">
+                    ⚠️ ไม่พบลิงก์ในไฟล์นี้เลย — ลองเช็คว่ามีคอลัมน์ที่เก็บลิงก์ Google Maps อยู่จริงไหม
+                </div>
+                """, unsafe_allow_html=True)
+
+            qr_report_cols = st.columns(len(qr_report))
+            for col, r in zip(qr_report_cols, qr_report):
+                with col:
+                    if r['link_col_letter'] is None:
+                        stat_box(f"SHEET: {r['sheet']}", "ไม่พบลิงก์", f"{r['total_rows']:,} แถว")
+                    else:
+                        stat_box(f"SHEET: {r['sheet']}", f"{r['qr_count']:,} QR", f"พบลิงก์ในคอลัมน์ {r['link_col_letter']}")
+
+            if total_qr > 0:
+                st.write("")
+                qr_batch_base_name = qr_file.name.rsplit('.', 1)[0]
+                st.download_button(
+                    "⬇️ ดาวน์โหลดไฟล์ที่ฝัง QR Code แล้ว (Excel)",
+                    data=qr_out_bytes,
+                    file_name=f"{qr_batch_base_name}_with_qr.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="qr_batch_download_btn",
+                )
