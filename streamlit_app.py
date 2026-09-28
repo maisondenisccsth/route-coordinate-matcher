@@ -413,8 +413,37 @@ def find_header_row(rows, keys):
     return None, None
 
 
+def _cell_blank(v):
+    return v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == ''
+
+
+def _fill_merged_down(raw, ws, header_row):
+    """ไฟล์บางแบบ (เช่น Route Planning สมุย) ใช้ merge cell แนวตั้ง: จุดส่ง 1 จุดมีหลาย PO
+    แต่ Cust. ID / ชื่อลูกค้า / Ship-to ถูก merge ไว้แค่แถวบนสุด pandas จะเห็นแถวล่างๆ เป็นช่องว่าง
+    -> แถว PO พวกนั้นจะไม่มี Cust ID และหลุดหายจากผลลัพธ์ ฟังก์ชันนี้เติมค่าจาก merge ลงไปทุกแถว
+    ในช่วงนั้น (ทำเฉพาะ merge แนวตั้งที่อยู่ใต้หัวตาราง และเฉพาะเมื่อค่ามุมบนซ้ายตรงกันระหว่าง
+    pandas กับ openpyxl — ถ้าไม่ตรงแปลว่าแถวไม่ตรงกัน ข้ามไปเลย ไม่เดา)"""
+    for rng in ws.merged_cells.ranges:
+        r0, c0 = rng.min_row - 1, rng.min_col - 1
+        r1, c1 = rng.max_row - 1, rng.max_col - 1
+        if r0 <= header_row or c0 != c1 or r1 >= len(raw):
+            continue
+        top = raw[r0][c0] if c0 < len(raw[r0]) else None
+        anchor = ws.cell(row=rng.min_row, column=rng.min_col).value
+        if _cell_blank(top) or anchor is None or str(top).strip() != str(anchor).strip():
+            continue
+        for r in range(r0 + 1, r1 + 1):
+            if c0 < len(raw[r]) and _cell_blank(raw[r][c0]):
+                raw[r][c0] = top
+
+
 def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipto=True):
     xl = pd.ExcelFile(io.BytesIO(file_bytes))
+    # ใช้อ่าน merge cell (.xlsx เท่านั้น — .xls เปิดด้วย openpyxl ไม่ได้ ก็ข้ามไปตามปกติ)
+    try:
+        merge_wb = load_workbook(io.BytesIO(file_bytes))
+    except Exception:
+        merge_wb = None
     output_sheets = {}
     unique_stops_sheets = {}  # เวอร์ชัน "จุดส่งไม่ซ้ำ" คอลัมน์เหมือนไฟล์หลักทุกอย่าง แค่ยุบแถวพิกัดซ้ำ
     report = []
@@ -434,7 +463,7 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
 
     for sheet_name in sheet_list:
         raw = xl.parse(sheet_name, header=None).values.tolist()
-        header_row, cust_col = find_header_row(raw, ['cust code', 'cust id'])
+        header_row, cust_col = find_header_row(raw, ['cust code', 'cust id', 'cust. id', 'cust.id'])
 
         # ถ้าไม่เจอ Cust Code/ID เลย ลองหาคอลัมน์ทางเลือก (ไฟล์บางแบบ เช่น export สไตล์ invoice
         # ของโซนภูเก็ต/สมุย ไม่มีคอลัมน์ Cust Code เลย มีแต่ Cust. Name)
@@ -446,6 +475,9 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
             report.append({'sheet': sheet_name, 'skipped': True, 'matched': 0, 'total': 0})
             continue
 
+        if merge_wb is not None and sheet_name in merge_wb.sheetnames:
+            _fill_merged_down(raw, merge_wb[sheet_name], header_row)
+
         header = raw[header_row]
         ship_col = None
         for i, v in enumerate(header):
@@ -456,9 +488,16 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
         # เผื่อไฟล์ตั้งชื่อคอลัมน์แบบนี้ (เจอในไฟล์ export บางโซน)
         if ship_col is None:
             for i, v in enumerate(header):
-                if isinstance(v, str) and v.strip().lower() == 'ship to':
+                if isinstance(v, str) and v.strip().lower() in ('ship to', 'ship-to', 'shipto'):
                     ship_col = i
                     break
+
+        # คอลัมน์ Ship To มีอยู่ แต่ว่างทั้งชีท (เช่นชีท 23.09.26 ของไฟล์สมุย) = เท่ากับไม่มีคอลัมน์นี้
+        # -> ตัดสินใจระดับชีทให้ไปใช้ชื่อลูกค้าแทน (ยังเป็นการจับด้วยชื่อ ไม่ใช่เดาด้วยรหัส)
+        if ship_col is not None and all(
+            ship_col >= len(rw) or _cell_blank(rw[ship_col]) for rw in raw[header_row + 1:]
+        ):
+            ship_col = None
 
         # ถ้าไม่มีคอลัมน์ ShipTo Name ในชีทนี้เลย ให้ใช้ Cust Name (หรือคอลัมน์ชื่ออื่นที่ใกล้เคียง) แทน
         name_fallback_col = None
