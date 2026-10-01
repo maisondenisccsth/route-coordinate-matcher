@@ -1493,6 +1493,37 @@ def _apply_xls_styles(ws, sh, xlrd_book, n_rows, n_cols):
                 pass
 
 
+_HYPERLINK_FORMULA_RE = re.compile(
+    r'^=\s*HYPERLINK\(\s*"((?:[^"]|"")*)"\s*(?:[,;]\s*"((?:[^"]|"")*)"\s*)?\)\s*$',
+    re.IGNORECASE,
+)
+
+
+def _flatten_hyperlink_formulas(ws, cached_ws=None):
+    """=HYPERLINK("url","ชื่อ") -> ค่าเซลล์ = "ชื่อ" (ข้อความธรรมดา) + cell.hyperlink = url
+    ชื่อที่ใช้: ค่าที่ Excel คำนวณเก็บไว้ (ถ้ามี) ไม่งั้นอ่านจากอาร์กิวเมนต์ตัวที่ 2 ในสูตร
+    ถ้าสูตรซับซ้อนกว่านี้ (อ้างเซลล์อื่น ฯลฯ) และไม่มีค่าที่คำนวณไว้ -> ปล่อยสูตรเดิมไว้ ไม่เดา
+    Returns จำนวนเซลล์ที่แปลง"""
+    n = 0
+    for row in ws.iter_rows():
+        for cell in row:
+            v = cell.value
+            if not (isinstance(v, str) and v.lstrip().upper().startswith('=HYPERLINK(')):
+                continue
+            m = _HYPERLINK_FORMULA_RE.match(v.strip())
+            url = m.group(1).replace('""', '"') if m else None
+            name = m.group(2).replace('""', '"') if (m and m.group(2) is not None) else None
+            cached = cached_ws[cell.coordinate].value if cached_ws is not None else None
+            display = cached if cached not in (None, '') else (name if name is not None else url)
+            if display is None:
+                continue
+            cell.value = display
+            if url:
+                cell.hyperlink = url
+            n += 1
+    return n
+
+
 def process_qr_batch_file(file_bytes, selected_sheets=None, box_size=5, border=2):
     """
     Scans each selected sheet for a column containing links and returns a NEW
@@ -1524,6 +1555,17 @@ def process_qr_batch_file(file_bytes, selected_sheets=None, box_size=5, border=2
     report = []
 
     if native:
+        # เซลล์ที่เป็นสูตร =HYPERLINK(...) (เช่นคอลัมน์ "ที่ตั้ง" ในไฟล์ OptimoRoute) -> เขียนชื่อจริงลงไป
+        # เป็นข้อความธรรมดา + ใส่ลิงก์จริงไว้ที่เซลล์ (ยังกดได้) ทำก่อนสแกนหาลิงก์ เพื่อไม่ให้ข้อความสูตร
+        # ที่มี https:// ถูกเข้าใจผิดว่าเป็นคอลัมน์ลิงก์
+        try:
+            cached_wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+        except Exception:
+            cached_wb = None
+        for ws_any in out_wb.worksheets:
+            cached_ws = cached_wb[ws_any.title] if cached_wb is not None and ws_any.title in cached_wb.sheetnames else None
+            _flatten_hyperlink_formulas(ws_any, cached_ws)
+
         for sn in sheets_to_process:
             if sn not in out_wb.sheetnames:
                 continue
