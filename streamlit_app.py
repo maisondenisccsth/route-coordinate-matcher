@@ -1336,6 +1336,20 @@ def find_link_column(sheet_rows):
     return max(counts, key=counts.get)
 
 
+def _guess_table_top(raw_rows):
+    """หาแถวหัวตาราง (0-indexed): แถวแรกที่มีข้อมูลเกินครึ่งของแถวที่กว้างที่สุด (อย่างน้อย 3 ช่อง)
+    ใช้แค่กำหนดตำแหน่งวาง QR — ถ้าหาไม่เจอคืน None"""
+    counts = [sum(1 for v in row if not (v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == ''))
+              for row in raw_rows]
+    if not counts:
+        return None
+    need = max(3, max(counts) / 2)
+    for i, c in enumerate(counts):
+        if c >= need:
+            return i
+    return None
+
+
 def _embed_qr_column(ws, raw_rows, link_col, start_col0, box_size=5, border=2):
     """Appends a 'QR Code' column at 0-based column index start_col0, embedding
     a QR image at NATIVE resolution (no shrinking) for every row whose link_col
@@ -1345,17 +1359,34 @@ def _embed_qr_column(ws, raw_rows, link_col, start_col0, box_size=5, border=2):
     new_col_letter = get_column_letter(start_col0 + 1)
     ws.cell(row=1, column=start_col0 + 1, value="QR Code")
 
-    qr_count = 0
-    max_w_px = 0
+    links = []
     for r_idx, row in enumerate(raw_rows):
         v = row[link_col] if link_col < len(row) else None
-        if not isinstance(v, str):
-            continue
-        m = QR_URL_RE.search(v)
-        if not m:
-            continue
+        if isinstance(v, str):
+            m = QR_URL_RE.search(v)
+            if m:
+                links.append((r_idx, m.group(0)))
+
+    # ลิงก์เดียวทั้งชีท (เช่นลิงก์เส้นทางท้ายชีทของไฟล์ OptimoRoute) -> วาง QR ลอยไว้ขวาบนข้างตาราง
+    # เริ่มที่แถวข้อมูลแรก และไม่ยืดความสูงแถวไหนเลย (แถวลิงก์ด้านล่างสูงปกติ)
+    # ลิงก์หลายแถว (เช่น Master Data) -> วาง QR ข้างแถวของมันเหมือนเดิม จะได้รู้ว่า QR ไหนของแถวไหน
+    if len(links) == 1:
+        r_idx, url = links[0]
         try:
-            qr_bytes, (w_px, h_px) = generate_qr_bytes(m.group(0), box_size=box_size, border=border)
+            qr_bytes, (w_px, h_px) = generate_qr_bytes(url, box_size=box_size, border=border)
+        except Exception:
+            return 0
+        top = _guess_table_top(raw_rows)
+        anchor_row = min(top + 2, r_idx + 1) if top is not None else 2  # แถวข้อมูลแรก (1-indexed)
+        ws.add_image(XLImage(io.BytesIO(qr_bytes)), f"{new_col_letter}{anchor_row}")
+        ws.column_dimensions[new_col_letter].width = max(12, w_px / 7 + 2)
+        return 1
+
+    qr_count = 0
+    max_w_px = 0
+    for r_idx, url in links:
+        try:
+            qr_bytes, (w_px, h_px) = generate_qr_bytes(url, box_size=box_size, border=border)
         except Exception:
             continue
         img = XLImage(io.BytesIO(qr_bytes))
