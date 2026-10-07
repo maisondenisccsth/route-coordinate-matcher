@@ -359,6 +359,16 @@ st.markdown("""
         background: linear-gradient(90deg, transparent, #2A4A72, transparent);
         margin: 22px 0;
     }
+    /* ---------- Tabs: ตัวหนังสือสว่างตลอด ไม่ต้องกดก่อนถึงจะเห็น ---------- */
+    [data-testid="stTab"], [role="tab"], button[data-baseweb="tab"] { color: #F0F5FA !important; }
+    [data-testid="stTab"] p, [role="tab"] p, button[data-baseweb="tab"] p {
+        color: #F0F5FA !important; font-weight: 600; font-size: 15px;
+    }
+    [data-testid="stTab"]:hover p, [role="tab"]:hover p, button[data-baseweb="tab"]:hover p { color: #FFB347 !important; }
+    [data-testid="stTab"][aria-selected="true"] p, [role="tab"][aria-selected="true"] p,
+    button[data-baseweb="tab"][aria-selected="true"] p { color: #FF8C42 !important; font-weight: 700; }
+    [role="tablist"], [data-baseweb="tab-list"] { border-bottom: 1px solid rgba(195,212,234,0.18); }
+    [data-baseweb="tab-highlight"], .react-aria-SelectionIndicator { background-color: #FF8C42 !important; }
 </style>
 """, unsafe_allow_html=True)
 
