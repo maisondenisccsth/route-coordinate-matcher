@@ -901,7 +901,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-tab_process, tab_product, tab_qr = st.tabs(["📤  ประมวลผลไฟล์", "📦  Product Master", "🔗  QR Code"])
+tab_process, tab_product, tab_qr, tab_bkk = st.tabs(["📤  ประมวลผลไฟล์", "📦  Product Master", "🔗  QR Code", "🏙️  For BKK"])
 
 with tab_process:
     if not MASTER_SHEET_CSV_URL:
@@ -1824,3 +1824,335 @@ with tab_qr:
                     use_container_width=True,
                     key="qr_batch_download_btn",
                 )
+
+
+# ============================================================
+# TAB 4: FOR BKK — Sheet1 -> ใบงานต่อออเดอร์ (แยก Retail และ InterExp/B&W ออกเป็นชีทของตัวเอง)
+# ============================================================
+BKK_COLUMNS = ['Order Date', 'OrderNo', 'Customers Code', 'Cust Type', 'Customer Name', 'ShipTo Name',
+               'ShipTo.Address', 'Route', 'Remark', 'เวลาเข้า', 'เวลาออก', 'Latitude', 'Longitude']
+# ความกว้างคอลัมน์ลอกจากใบงาน Sheet2 ที่ทีมใช้อยู่จริง (A..K) + Lat/Lon
+BKK_COL_WIDTHS = [9.9, 39.1, 14.4, 9.1, 53.3, 53.7, 40.1, 19.4, 27.4, 7.7, 8.6, 12.5, 12.5]
+
+
+def build_channel_map(df):
+    """Customer Master ทั้งตาราง (ไม่ตัดแถวที่ยังไม่มีพิกัด) -> {ShipTo Name ที่ normalize แล้ว: Channel}
+    Channel คือคอลัมน์ C ของ Master; ถ้าชื่อเดียวกันมีหลายแถว ใช้แถวแรกที่เจอ"""
+    ch_col = next((c for c in df.columns if str(c).strip().lower() == 'channel'), None)
+    if ch_col is None:
+        ch_col = df.columns[2]
+    out = {}
+    for name, ch in zip(df['Ship To Name'], df[ch_col]):
+        key = normalize(name)
+        if key and key not in out and not _cell_blank(ch):
+            out[key] = str(ch).strip()
+    return out
+
+
+@st.cache_data(ttl=300)
+def load_master_channels(url):
+    df = pd.read_csv(url)
+    df.columns = [c.strip() for c in df.columns]
+    if 'Ship To Name' not in df.columns:
+        raise ValueError("ไม่พบคอลัมน์ Ship To Name ใน Master")
+    return build_channel_map(df)
+
+
+def _bkk_clean_key(v):
+    """975484.0 -> 975484, ' 5 ' -> '5', 1.0 -> 1 (ให้ OrderNo / Route เทียบกันได้ตรงๆ)"""
+    if isinstance(v, float) and v == int(v):
+        return int(v)
+    if isinstance(v, str):
+        s = v.strip()
+        return int(s) if s.isdigit() else s
+    return v
+
+
+def read_bkk_orders(file_bytes):
+    """อ่าน Sheet1 เท่านั้น -> 1 แถวต่อ 1 OrderNo (แถวแรกที่เจอของออเดอร์นั้น) ตามลำดับเดิมในไฟล์
+    ตัดแถวว่างทิ้ง Returns (orders_df, info)"""
+    xl = pd.ExcelFile(io.BytesIO(file_bytes))
+    sheet = 'Sheet1' if 'Sheet1' in xl.sheet_names else xl.sheet_names[0]
+    raw = xl.parse(sheet, header=None).values.tolist()
+    header_row, c_order = find_header_row(raw, ['orderno', 'order no', 'order no.'])
+    if header_row is None:
+        raise ValueError(f'ไม่พบคอลัมน์ OrderNo ในชีท "{sheet}"')
+    header = [v.strip().lower() if isinstance(v, str) else '' for v in raw[header_row]]
+
+    def col(*names, prefix=None):
+        for i, h in enumerate(header):
+            if h in names:
+                return i
+        if prefix:
+            for i, h in enumerate(header):
+                if h.startswith(prefix):
+                    return i
+        return None
+
+    c_date = col('order date')
+    c_code = col('cust code', 'cust id', 'cust. id', 'cust.id', 'customers code', 'customer code')
+    c_type = col('cust type', 'customer type')
+    c_cname = col('cust name', 'cust. name', 'customer name')
+    c_sname = col('shipto name', 'ship to name', 'ship-to name')
+    c_addr = col('shipto.address', prefix='shipto.address')
+    if c_addr is None:
+        c_addr = col('shipto.c')
+    c_route = col('route')
+
+    def get(row, c):
+        if c is None or c >= len(row) or _cell_blank(row[c]):
+            return None
+        v = row[c]
+        return v.strip() if isinstance(v, str) else v
+
+    rows, seen, multi_route = [], {}, {}
+    line_count = no_order_rows = 0
+    for row in raw[header_row + 1:]:
+        if all(_cell_blank(v) for v in row):
+            continue  # แถวว่าง
+        if _cell_blank(row[c_order]):
+            no_order_rows += 1  # มีข้อมูลแต่ไม่มีเลขออเดอร์ -> นับไว้รายงาน
+            continue
+        line_count += 1
+        order_no = _bkk_clean_key(row[c_order])
+        route = _bkk_clean_key(get(row, c_route))
+        if order_no in seen:
+            if route != seen[order_no]['Route'] and route is not None:
+                multi_route.setdefault(order_no, [seen[order_no]['Route']])
+                if route not in multi_route[order_no]:
+                    multi_route[order_no].append(route)
+            continue
+        rec = {
+            'Order Date': get(row, c_date), 'OrderNo': order_no, 'Customers Code': get(row, c_code),
+            'Cust Type': get(row, c_type), 'Customer Name': get(row, c_cname),
+            'ShipTo Name': get(row, c_sname), 'ShipTo.Address': get(row, c_addr), 'Route': route,
+        }
+        seen[order_no] = rec
+        rows.append(rec)
+
+    orders = pd.DataFrame(rows, columns=BKK_COLUMNS[:8])
+    info = {'sheet': sheet, 'lines': line_count, 'orders': len(orders), 'no_order_rows': no_order_rows,
+            'multi_route': multi_route, 'has_shipto_col': c_sname is not None}
+    return orders, info
+
+
+def _bkk_route_sort_key(route):
+    """Route ตัวเลขมาก่อนเรียงตามค่า (1, 2, 3, 11, 12) แล้วตามด้วย Route ที่เป็นตัวหนังสือ"""
+    if isinstance(route, (int, float)) and not pd.isna(route):
+        return (0, float(route), '')
+    return (1, 0.0, '' if route is None else str(route))
+
+
+BKK_CARRIER_SHEET = 'InterExp-B&W'
+
+
+def _bkk_is_carrier_route(route):
+    """Route ที่ส่งผ่านขนส่งภายนอก: InterExp และ IE,B&W (เขียนได้หลายแบบ เช่น 'IE B&W', 'IE,BW', 'B&W')"""
+    key = re.sub(r'[^A-Z0-9]', '', str(route).upper()) if route is not None else ''
+    return key.startswith('INTEREXP') or key in ('IEBW', 'BW', 'IE')
+
+
+def process_bkk_orders(orders, info, master_df, channel_map, dates=None):
+    """แยก Retail / ไม่ใช่ Retail + เติม Lat/Lon (จับด้วย ShipTo Name แบบเดียวกับแท็บประมวลผลไฟล์)
+    Retail ดูจาก Channel ใน Master (คอลัมน์ C) ตาม ShipTo Name; ถ้าไม่เจอชื่อใน Master เลย
+    ใช้ Cust Type ในไฟล์แทน (R = Retail) แล้วนับไว้รายงาน
+    ออเดอร์ที่ Route เป็น InterExp / IE,B&W แยกไปชีทของตัวเองก่อนเสมอ (ไม่ว่าจะเป็น Retail หรือไม่)
+    ที่เหลือค่อยแบ่ง Retail / ไม่ใช่ Retail
+    Returns (normal_df, retail_df, carrier_df, info)"""
+    df = orders.copy()
+    if dates is not None:
+        keep = set(str(d) for d in dates)
+        df = df[df['Order Date'].astype(str).isin(keep)]
+
+    by_ship = master_df.drop_duplicates('norm_ship').set_index('norm_ship')
+    name_col = 'ShipTo Name' if info.get('has_shipto_col', True) else 'Customer Name'
+
+    lats, lons, is_retail, by_cust_type = [], [], [], 0
+    for _, r in df.iterrows():
+        key = normalize(r[name_col])
+        ch = channel_map.get(key) if key else None
+        if ch is not None:
+            is_retail.append(ch.strip().lower() == 'retail')
+        else:
+            by_cust_type += 1
+            is_retail.append(str(r['Cust Type']).strip().upper() == 'R')
+        if key and key in by_ship.index:
+            hit = by_ship.loc[key]
+            lats.append(hit['Latitude'])
+            lons.append(hit['Longitude'])
+        else:
+            lats.append(None)
+            lons.append(None)
+
+    df['Remark'] = None
+    df['เวลาเข้า'] = None
+    df['เวลาออก'] = None
+    df['Latitude'] = lats
+    df['Longitude'] = lons
+    df['_retail'] = is_retail
+    df['_rk'] = df['Route'].map(_bkk_route_sort_key)
+    df['_ck'] = df['Customer Name'].map(lambda v: '' if v is None else str(v))
+    df['_ok'] = df['OrderNo'].map(lambda v: (0, v, '') if isinstance(v, int) else (1, 0, str(v)))
+    df = df.sort_values(['_rk', '_ck', '_ok'], kind='stable')
+
+    df['_carrier'] = df['Route'].map(_bkk_is_carrier_route)
+    normal = df[~df['_carrier'] & ~df['_retail']][BKK_COLUMNS].reset_index(drop=True)
+    retail = df[~df['_carrier'] & df['_retail']][BKK_COLUMNS].reset_index(drop=True)
+    carrier = df[df['_carrier']][BKK_COLUMNS].reset_index(drop=True)
+    out_info = dict(info)
+    out_info.update({
+        'selected_orders': len(df), 'normal': len(normal), 'retail': len(retail), 'carrier': len(carrier),
+        'carrier_retail': int((df['_carrier'] & df['_retail']).sum()),
+        'retail_by_cust_type': by_cust_type,
+        'coords_normal': int(normal['Latitude'].notna().sum()), 'coords_retail': int(retail['Latitude'].notna().sum()),
+        'coords_carrier': int(carrier['Latitude'].notna().sum()),
+    })
+    return normal, retail, carrier, out_info
+
+
+def bkk_to_excel_bytes(normal_df, retail_df, carrier_df):
+    """3 ชีท (Order / Retail / InterExp-B&W) หน้าตาเดียวกับใบงาน Sheet2: หัวกระดาษ ทะเบียนรถ/วันที่/เลขไมล์,
+    หัวตารางแถว 4, ฟอนต์ Cordia New, เส้นขอบทุกช่อง + Lat/Lon ต่อท้าย"""
+    wb = Workbook()
+    wb.remove(wb.active)
+    thin = Side(style='thin')
+    border = Border(top=thin, bottom=thin, left=thin, right=thin)
+    f_top = Font(name='Cordia New', size=12, bold=True)
+    f_head = Font(name='Cordia New', size=14, bold=True, underline='single')
+    f_body = Font(name='Cordia New', size=14)
+    center_cols = {'Cust Type', 'Route'}
+
+    for title, df in (('Order', normal_df), ('Retail', retail_df), (BKK_CARRIER_SHEET, carrier_df)):
+        ws = wb.create_sheet(title=title)
+        ws['B1'] = 'ทะเบียนรถ____________________'
+        ws['F1'] = 'วันที่______________________'
+        ws['B2'] = 'เลขไมล์ออกจากคลัง___________________________'
+        ws['F2'] = 'เลขไมล์กลับถึงคลัง___________________________'
+        for ref in ('B1', 'F1', 'B2', 'F2'):
+            ws[ref].font = f_top
+        for r in (1, 2, 3):
+            ws.row_dimensions[r].height = 18.75
+
+        for c, name in enumerate(BKK_COLUMNS, start=1):
+            cell = ws.cell(row=4, column=c, value=name)
+            cell.font = f_head
+            cell.border = border
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        ws.row_dimensions[4].height = 21
+
+        for i, rec in enumerate(df.itertuples(index=False), start=5):
+            for c, (name, v) in enumerate(zip(BKK_COLUMNS, rec), start=1):
+                if v is not None and isinstance(v, float) and pd.isna(v):
+                    v = None
+                cell = ws.cell(row=i, column=c, value=v)
+                cell.font = f_body
+                cell.border = border
+                cell.alignment = Alignment(horizontal='center' if name in center_cols else 'left', vertical='center')
+            ws.row_dimensions[i].height = 21.75
+
+        for c, w in enumerate(BKK_COL_WIDTHS, start=1):
+            ws.column_dimensions[get_column_letter(c)].width = w
+        ws.freeze_panes = 'A5'
+        ws.print_title_rows = '1:4'
+        ws.page_setup.orientation = 'landscape'
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+with tab_bkk:
+    st.markdown("##### 🏙️ For BKK — ทำใบงานจาก Sheet1")
+    st.caption("อัพโหลดไฟล์ route (ใช้เฉพาะ Sheet1) ระบบจะตัดแถวว่าง ยุบให้เหลือ 1 แถวต่อ 1 OrderNo "
+               "แยก Route InterExp / IE,B&W ไปชีทหนึ่ง แยก Retail ไปอีกชีท (ดู Channel ใน Master จาก ShipTo Name) "
+               "แล้วเติม Lat/Lon ให้ ได้ไฟล์เดียว 3 ชีท: Order, Retail, InterExp-B&W หน้าตาเหมือนใบงาน Sheet2")
+
+    bkk_file = st.file_uploader("อัพโหลดไฟล์ route", type=['xls', 'xlsx'], label_visibility="collapsed", key="bkk_uploader")
+
+    if bkk_file is not None:
+        bkk_bytes = bkk_file.read()
+        try:
+            bkk_orders, bkk_info = read_bkk_orders(bkk_bytes)
+        except Exception as e:
+            st.error(f"อ่านไฟล์ไม่ได้: {e}")
+            st.stop()
+
+        bkk_dates = sorted({str(d) for d in bkk_orders['Order Date'] if d is not None})
+        st.markdown(f"""
+        <div class="rcm-card">
+            📄 ชีท <b>{bkk_info['sheet']}</b>: {bkk_info['lines']:,} รายการสินค้า → <b>{bkk_info['orders']:,} ออเดอร์</b> (OrderNo ไม่ซ้ำ)
+        </div>
+        """, unsafe_allow_html=True)
+
+        if len(bkk_dates) > 1:
+            bkk_sel_dates = st.multiselect(
+                "Order Date ที่จะเอา (ค่าเริ่มต้น = ทุกวันที่มีใน Sheet1)",
+                options=bkk_dates, default=bkk_dates, key="bkk_dates",
+            )
+        else:
+            bkk_sel_dates = bkk_dates
+
+        if not bkk_sel_dates:
+            st.warning("⚠️ กรุณาเลือก Order Date อย่างน้อย 1 วัน")
+            st.stop()
+
+        bkk_clicked = st.button("🚀 ทำใบงาน For BKK", type="primary", use_container_width=True, key="bkk_btn")
+
+        if bkk_clicked:
+            with st.spinner("🛰️ กำลังแยก Retail และเติมพิกัด..."):
+                try:
+                    bkk_channels = load_master_channels(MASTER_SHEET_CSV_URL)
+                    bkk_normal, bkk_retail, bkk_carrier, bkk_result = process_bkk_orders(
+                        bkk_orders, bkk_info, master_df, bkk_channels,
+                        dates=bkk_sel_dates if len(bkk_dates) > 1 else None,
+                    )
+                    st.session_state['bkk_xlsx'] = bkk_to_excel_bytes(bkk_normal, bkk_retail, bkk_carrier)
+                    st.session_state['bkk_result'] = bkk_result
+                    st.session_state['bkk_filename'] = bkk_file.name
+                except Exception as e:
+                    st.error(f"เกิดข้อผิดพลาด: {e}")
+                    st.exception(e)
+
+        if 'bkk_result' in st.session_state and st.session_state.get('bkk_filename') == bkk_file.name:
+            res = st.session_state['bkk_result']
+            st.markdown(f"""
+            <div class="rcm-card rcm-card-success">
+                🎯 <b>เสร็จแล้ว!</b> {res['selected_orders']:,} ออเดอร์ → Order {res['normal']:,} + Retail {res['retail']:,} + InterExp/B&W {res['carrier']:,}
+            </div>
+            """, unsafe_allow_html=True)
+
+            bc1, bc2, bc3 = st.columns(3)
+            with bc1:
+                stat_box("SHEET: Order", f"{res['normal']:,}",
+                          f"มีพิกัด {res['coords_normal']:,} / {res['normal']:,}")
+            with bc2:
+                stat_box("SHEET: Retail", f"{res['retail']:,}",
+                          f"มีพิกัด {res['coords_retail']:,} / {res['retail']:,}")
+            with bc3:
+                stat_box("SHEET: InterExp-B&W", f"{res['carrier']:,}",
+                          f"มีพิกัด {res['coords_carrier']:,} / {res['carrier']:,} · เป็น Retail {res['carrier_retail']:,}")
+
+            bkk_notes = []
+            if res['retail_by_cust_type']:
+                bkk_notes.append(f"{res['retail_by_cust_type']:,} ออเดอร์ไม่เจอ ShipTo Name ใน Master — แยก Retail จาก Cust Type ในไฟล์แทน (R = Retail)")
+            if res['multi_route']:
+                mr = ', '.join(f"{k} ({' / '.join(str(x) for x in v)})" for k, v in list(res['multi_route'].items())[:10])
+                bkk_notes.append(f"{len(res['multi_route']):,} ออเดอร์มีมากกว่า 1 Route ใน Sheet1 — เก็บ Route แรกที่เจอ: {mr}")
+            if res['no_order_rows']:
+                bkk_notes.append(f"{res['no_order_rows']:,} แถวมีข้อมูลแต่ไม่มี OrderNo — ไม่ได้เอามา")
+            if bkk_notes:
+                st.markdown('<div class="rcm-card rcm-card-warn">⚠️ <b>ข้อสังเกต</b><br>' + '<br>'.join('• ' + n for n in bkk_notes) + '</div>',
+                            unsafe_allow_html=True)
+
+            st.write("")
+            st.download_button(
+                "⬇️ ดาวน์โหลดใบงาน For BKK (Excel 3 ชีท: Order + Retail + InterExp-B&W)",
+                data=st.session_state['bkk_xlsx'],
+                file_name=f"{bkk_file.name.rsplit('.', 1)[0]}_For_BKK.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="bkk_download_btn",
+            )
