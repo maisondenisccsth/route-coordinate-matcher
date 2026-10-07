@@ -1945,6 +1945,14 @@ def _bkk_route_sort_key(route):
 
 BKK_CARRIER_SHEET = 'InterExp-B&W'
 
+# ลูกค้าที่ในระบบเป็น R (Retail) แต่ให้ถือเป็น F (Food Service) เสมอ — เพิ่มชื่อในลิสต์นี้ได้
+BKK_FORCE_FOOD_SERVICE = ['FMR-for RT Sale Dept.']
+
+
+def _bkk_name_key(v):
+    """เทียบชื่อแบบไม่สนตัวพิมพ์ เว้นวรรค จุด ขีด: 'FMR- for RT Sale Dept' == 'FMR-for RT Sale Dept.'"""
+    return re.sub(r'[^A-Z0-9ก-๙]', '', str(v).upper()) if v is not None else ''
+
 
 def _bkk_is_carrier_route(route):
     """Route ที่ส่งผ่านขนส่งภายนอก: InterExp และ IE,B&W (เขียนได้หลายแบบ เช่น 'IE B&W', 'IE,BW', 'B&W')"""
@@ -1967,15 +1975,23 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None):
     by_ship = master_df.drop_duplicates('norm_ship').set_index('norm_ship')
     name_col = 'ShipTo Name' if info.get('has_shipto_col', True) else 'Customer Name'
 
-    lats, lons, is_retail, by_cust_type = [], [], [], 0
+    forced_keys = {_bkk_name_key(n) for n in BKK_FORCE_FOOD_SERVICE}
+    lats, lons, is_retail, cust_types, by_cust_type, forced_fs = [], [], [], [], 0, 0
     for _, r in df.iterrows():
         key = normalize(r[name_col])
         ch = channel_map.get(key) if key else None
-        if ch is not None:
+        if _bkk_name_key(r['ShipTo Name']) in forced_keys or _bkk_name_key(r['Customer Name']) in forced_keys:
+            # ข้อยกเว้นที่กำหนดไว้: ถือเป็น Food Service เสมอ และเปลี่ยน Cust Type เป็น F
+            forced_fs += 1
+            is_retail.append(False)
+            cust_types.append('F')
+        elif ch is not None:
             is_retail.append(ch.strip().lower() == 'retail')
+            cust_types.append(r['Cust Type'])
         else:
             by_cust_type += 1
             is_retail.append(str(r['Cust Type']).strip().upper() == 'R')
+            cust_types.append(r['Cust Type'])
         if key and key in by_ship.index:
             hit = by_ship.loc[key]
             lats.append(hit['Latitude'])
@@ -1984,6 +2000,7 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None):
             lats.append(None)
             lons.append(None)
 
+    df['Cust Type'] = cust_types
     df['Remark'] = None
     df['เวลาเข้า'] = None
     df['เวลาออก'] = None
@@ -1999,11 +2016,14 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None):
     normal = df[~df['_carrier'] & ~df['_retail']][BKK_COLUMNS].reset_index(drop=True)
     retail = df[~df['_carrier'] & df['_retail']][BKK_COLUMNS].reset_index(drop=True)
     carrier = df[df['_carrier']][BKK_COLUMNS].reset_index(drop=True)
+    # คอลัมน์ Route ในไฟล์ผลลัพธ์ปล่อยว่างไว้ให้คนจัดกรอกเอง (Route จาก Sheet1 ใช้แค่แยกชีทกับเรียงลำดับ)
+    for part in (normal, retail, carrier):
+        part['Route'] = None
     out_info = dict(info)
     out_info.update({
         'selected_orders': len(df), 'normal': len(normal), 'retail': len(retail), 'carrier': len(carrier),
         'carrier_retail': int((df['_carrier'] & df['_retail']).sum()),
-        'retail_by_cust_type': by_cust_type,
+        'retail_by_cust_type': by_cust_type, 'forced_fs': forced_fs,
         'coords_normal': int(normal['Latitude'].notna().sum()), 'coords_retail': int(retail['Latitude'].notna().sum()),
         'coords_carrier': int(carrier['Latitude'].notna().sum()),
     })
@@ -2138,9 +2158,11 @@ with tab_bkk:
             bkk_notes = []
             if res['retail_by_cust_type']:
                 bkk_notes.append(f"{res['retail_by_cust_type']:,} ออเดอร์ไม่เจอ ShipTo Name ใน Master — แยก Retail จาก Cust Type ในไฟล์แทน (R = Retail)")
+            if res.get('forced_fs'):
+                bkk_notes.append(f"{res['forced_fs']:,} ออเดอร์ของ {', '.join(BKK_FORCE_FOOD_SERVICE)} ถูกเปลี่ยนเป็น F (Food Service) ตามที่ตั้งไว้")
             if res['multi_route']:
                 mr = ', '.join(f"{k} ({' / '.join(str(x) for x in v)})" for k, v in list(res['multi_route'].items())[:10])
-                bkk_notes.append(f"{len(res['multi_route']):,} ออเดอร์มีมากกว่า 1 Route ใน Sheet1 — เก็บ Route แรกที่เจอ: {mr}")
+                bkk_notes.append(f"{len(res['multi_route']):,} ออเดอร์มีมากกว่า 1 Route ใน Sheet1 — ใช้ Route แรกที่เจอในการแยกชีท: {mr}")
             if res['no_order_rows']:
                 bkk_notes.append(f"{res['no_order_rows']:,} แถวมีข้อมูลแต่ไม่มี OrderNo — ไม่ได้เอามา")
             if bkk_notes:
