@@ -473,12 +473,15 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
 
     for sheet_name in sheet_list:
         raw = xl.parse(sheet_name, header=None).values.tolist()
-        header_row, cust_col = find_header_row(raw, ['cust code', 'cust id', 'cust. id', 'cust.id'])
+        header_row, cust_col = find_header_row(raw, [
+            'cust code', 'cust id', 'cust. id', 'cust.id', 'cust. code', 'cust.code',
+            'customer code', 'customers code', 'customer id', 'customers id',
+        ])
 
         # ถ้าไม่เจอ Cust Code/ID เลย ลองหาคอลัมน์ทางเลือก (ไฟล์บางแบบ เช่น export สไตล์ invoice
         # ของโซนภูเก็ต/สมุย ไม่มีคอลัมน์ Cust Code เลย มีแต่ Cust. Name)
         if header_row is None:
-            header_row, cust_col = find_header_row(raw, ['cust. name', 'cust name', 'cust.name'])
+            header_row, cust_col = find_header_row(raw, ['cust. name', 'cust name', 'cust.name', 'customer name', 'customers name'])
 
         if header_row is None:
             output_sheets[sheet_name] = xl.parse(sheet_name, header=None)
