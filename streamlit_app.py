@@ -359,6 +359,11 @@ st.markdown("""
         background: linear-gradient(90deg, transparent, #2A4A72, transparent);
         margin: 22px 0;
     }
+    /* ---------- Region picker ---------- */
+    [data-testid="stRadio"] > label p { color: #C3D4EA !important; font-weight: 600; font-size: 13px; letter-spacing: .3px; }
+    [data-testid="stRadio"] [role="radiogroup"] label p { color: #F0F5FA !important; font-weight: 600; font-size: 15px; }
+    [data-testid="stRadio"] [role="radiogroup"] { gap: 1.4rem; }
+
     /* ---------- Tabs: ตัวหนังสือสว่างตลอด ไม่ต้องกดก่อนถึงจะเห็น ---------- */
     [data-testid="stTab"], [role="tab"], button[data-baseweb="tab"] { color: #F0F5FA !important; }
     [data-testid="stTab"] p, [role="tab"] p, button[data-baseweb="tab"] p {
@@ -901,12 +906,19 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-tab_process, tab_product, tab_qr, tab_bkk = st.tabs(["📤  ประมวลผลไฟล์", "📦  Product Master", "🔗  QR Code", "🏙️  For BKK"])
+# ============================================================
+# เลือกพื้นที่ (จังหวัด) — แต่ละพื้นที่เห็นเฉพาะเครื่องมือที่ใช้จริง (ดู REGION_TABS ท้ายไฟล์)
+# ============================================================
+REGION_LABELS = {'BKK': '🏙️ BKK · กรุงเทพ', 'PKT': '🏝️ PKT · ภูเก็ต', 'SAMUI': '🌴 SAMUI · สมุย'}
+region = st.radio(
+    "📍 เลือกพื้นที่", options=list(REGION_LABELS), format_func=REGION_LABELS.get,
+    horizontal=True, key="region",
+)
 
-with tab_process:
+def _render_coords():
     if not MASTER_SHEET_CSV_URL:
         st.error("⚠️ ยังไม่ได้ตั้งค่า MASTER_SHEET_CSV_URL — ดูวิธีตั้งค่าใน DEPLOY_INSTRUCTIONS.md")
-        st.stop()
+        return
 
     try:
         master_df = load_master_data(MASTER_SHEET_CSV_URL)
@@ -936,7 +948,7 @@ with tab_process:
             st.markdown('</div>', unsafe_allow_html=True)
     except Exception as e:
         st.error(f"โหลด Master Data ไม่สำเร็จ: {e}")
-        st.stop()
+        return
 
     if 'show_master_preview' not in st.session_state:
         st.session_state['show_master_preview'] = False
@@ -968,7 +980,7 @@ with tab_process:
             all_sheet_names = xl_peek.sheet_names
         except Exception as e:
             st.error(f"เปิดไฟล์ไม่ได้: {e}")
-            st.stop()
+            return
 
         st.markdown("##### 📑 เลือก Sheet ที่ต้องการประมวลผล")
         sheet_cols = st.columns(min(len(all_sheet_names), 4))
@@ -981,7 +993,7 @@ with tab_process:
 
         if not selected_sheets:
             st.warning("⚠️ กรุณาเลือกอย่างน้อย 1 Sheet เพื่อเริ่มประมวลผล")
-            st.stop()
+            return
 
         dedupe_shipto = st.checkbox(
             "✨ ทำให้ Ship To Name ไม่ซ้ำกันอัตโนมัติ (เลือกแถวแรกที่เจอ)",
@@ -1134,7 +1146,7 @@ with tab_process:
     st.markdown('<div class="rcm-glow-divider"></div>', unsafe_allow_html=True)
     st.caption(f"🛰️ Master Data sync (cache): {datetime.now().strftime('%Y-%m-%d %H:%M')} — รีเฟรชอัตโนมัติทุก 5 นาที หรือกด \"ซิงค์ตอนนี้\" ด้านบนเพื่อดึงข้อมูลล่าสุดทันที")
 
-with tab_product:
+def _render_weight():
     if not PRODUCT_SHEET_CSV_URL:
         st.markdown("""
         <div class="rcm-card rcm-card-warn">
@@ -1171,7 +1183,7 @@ with tab_product:
                 st.markdown('</div>', unsafe_allow_html=True)
         except Exception as e:
             st.error(f"โหลด Product Master ไม่สำเร็จ: {e}")
-            st.stop()
+            return
 
         st.write("")
         search_term = st.text_input(
@@ -1211,7 +1223,7 @@ with tab_product:
                 w_sheet_names = wxl_peek.sheet_names
             except Exception as e:
                 st.error(f"เปิดไฟล์ไม่ได้: {e}")
-                st.stop()
+                return
 
             st.write("")
             wsheet_cols = st.columns(min(len(w_sheet_names), 4))
@@ -1224,7 +1236,7 @@ with tab_product:
 
             if not w_selected_sheets:
                 st.warning("⚠️ กรุณาเลือกอย่างน้อย 1 Sheet เพื่อเริ่มประมวลผล")
-                st.stop()
+                return
 
             st.write("")
             weight_process_clicked = st.button("⚖️ คำนวณน้ำหนัก", type="primary", use_container_width=True, key="weight_process_btn")
@@ -1686,7 +1698,7 @@ def process_qr_batch_file(file_bytes, selected_sheets=None, box_size=5, border=2
         return buf.getvalue(), report
 
 
-with tab_qr:
+def _render_qr():
     st.markdown("##### 🔗 สร้าง QR Code จากลิงก์")
     st.caption("ใส่ลิงก์อะไรก็ได้ — ลิงก์แอป, Google Sheets, เอกสาร ฯลฯ — ได้ QR Code กลับมาดาวน์โหลดได้ทันที")
 
@@ -1758,7 +1770,7 @@ with tab_qr:
             qr_all_sheet_names = qr_xl_peek.sheet_names
         except Exception as e:
             st.error(f"เปิดไฟล์ไม่ได้: {e}")
-            st.stop()
+            return
 
         st.markdown("###### 📑 เลือก Sheet ที่ต้องการสแกนหาลิงก์")
         qr_sheet_cols = st.columns(min(len(qr_all_sheet_names), 4))
@@ -1771,7 +1783,7 @@ with tab_qr:
 
         if not qr_selected_sheets:
             st.warning("⚠️ กรุณาเลือกอย่างน้อย 1 Sheet")
-            st.stop()
+            return
 
         st.write("")
         qr_batch_clicked = st.button("🔍 สแกนหาลิงก์ + สร้าง QR Code", type="primary", use_container_width=True, key="qr_batch_btn")
@@ -2103,7 +2115,10 @@ def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None):
     return buf.getvalue()
 
 
-with tab_bkk:
+def _render_bkk():
+    if not MASTER_SHEET_CSV_URL:
+        st.error("⚠️ ยังไม่ได้ตั้งค่า MASTER_SHEET_CSV_URL — ดูวิธีตั้งค่าใน DEPLOY_INSTRUCTIONS.md")
+        return
     st.markdown("##### 🏙️ For BKK — ทำใบงานจาก Sheet1")
     st.caption("อัพโหลดไฟล์ route (ใช้เฉพาะ Sheet1) ระบบจะตัดแถวว่าง ยุบให้เหลือ 1 แถวต่อ 1 OrderNo "
                "แยก Route InterExp / IE,B&W ไปชีทหนึ่ง แยก Retail ไปอีกชีท (ดู Channel ใน Master จาก ShipTo Name) "
@@ -2118,7 +2133,7 @@ with tab_bkk:
             bkk_orders, bkk_info = read_bkk_orders(bkk_bytes)
         except Exception as e:
             st.error(f"อ่านไฟล์ไม่ได้: {e}")
-            st.stop()
+            return
 
         bkk_dates = sorted({str(d) for d in bkk_orders['Order Date'] if d is not None})
         st.markdown(f"""
@@ -2137,13 +2152,14 @@ with tab_bkk:
 
         if not bkk_sel_dates:
             st.warning("⚠️ กรุณาเลือก Order Date อย่างน้อย 1 วัน")
-            st.stop()
+            return
 
         bkk_clicked = st.button("🚀 ทำใบงาน For BKK", type="primary", use_container_width=True, key="bkk_btn")
 
         if bkk_clicked:
             with st.spinner("🛰️ กำลังแยก Retail และเติมพิกัด..."):
                 try:
+                    master_df = load_master_data(MASTER_SHEET_CSV_URL)
                     bkk_channels = load_master_channels(MASTER_SHEET_CSV_URL)
                     bkk_normal, bkk_retail, bkk_carrier, bkk_notype, bkk_result = process_bkk_orders(
                         bkk_orders, bkk_info, master_df, bkk_channels,
@@ -2205,3 +2221,22 @@ with tab_bkk:
                 use_container_width=True,
                 key="bkk_download_btn",
             )
+
+
+# ============================================================
+# แท็บของแต่ละพื้นที่
+#   BKK   : For BKK + ใส่พิกัด Lat/Lon + Weight Calculator (+ QR Code)
+#   PKT   : ใส่พิกัด Lat/Lon (+ QR Code)
+#   SAMUI : ใส่พิกัด Lat/Lon (+ QR Code)
+# ============================================================
+REGION_TABS = {
+    'BKK': [("🏙️  For BKK", _render_bkk), ("📍  ใส่พิกัด Lat/Lon", _render_coords),
+            ("⚖️  Weight Calculator", _render_weight), ("🔗  QR Code", _render_qr)],
+    'PKT': [("📍  ใส่พิกัด Lat/Lon", _render_coords), ("🔗  QR Code", _render_qr)],
+    'SAMUI': [("📍  ใส่พิกัด Lat/Lon", _render_coords), ("🔗  QR Code", _render_qr)],
+}
+
+_region_tabs = REGION_TABS.get(region, REGION_TABS['BKK'])
+for _tab, (_label, _render) in zip(st.tabs([label for label, _ in _region_tabs]), _region_tabs):
+    with _tab:
+        _render()
