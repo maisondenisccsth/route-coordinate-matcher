@@ -1917,10 +1917,19 @@ def read_bkk_orders(file_bytes):
         order_no = _bkk_clean_key(row[c_order])
         route = _bkk_clean_key(get(row, c_route))
         if order_no in seen:
-            if route != seen[order_no]['Route'] and route is not None:
-                multi_route.setdefault(order_no, [seen[order_no]['Route']])
+            first = seen[order_no]
+            if route != first['Route'] and route is not None and first['Route'] is not None:
+                multi_route.setdefault(order_no, [first['Route']])
                 if route not in multi_route[order_no]:
                     multi_route[order_no].append(route)
+            # แถวแรกของออเดอร์นี้มีช่องไหนว่าง แต่แถวถัดไปของออเดอร์เดียวกันมีค่า -> เติมให้ (ไม่ทับค่าที่มีอยู่)
+            for fld, c in (('Order Date', c_date), ('Customers Code', c_code), ('Cust Type', c_type),
+                           ('Customer Name', c_cname), ('ShipTo Name', c_sname), ('ShipTo.Address', c_addr),
+                           ('Route', c_route)):
+                if first[fld] is None:
+                    v = get(row, c)
+                    if v is not None:
+                        first[fld] = _bkk_clean_key(v) if fld == 'Route' else v
             continue
         rec = {
             'Order Date': get(row, c_date), 'OrderNo': order_no, 'Customers Code': get(row, c_code),
@@ -1944,6 +1953,7 @@ def _bkk_route_sort_key(route):
 
 
 BKK_CARRIER_SHEET = 'InterExp-B&W'
+BKK_NOTYPE_SHEET = 'No Cust Type'
 
 # ลูกค้าที่ในระบบเป็น R (Retail) แต่ให้ถือเป็น F (Food Service) เสมอ — เพิ่มชื่อในลิสต์นี้ได้
 BKK_FORCE_FOOD_SERVICE = ['FMR-for RT Sale Dept.']
@@ -1964,9 +1974,11 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None):
     """แยก Retail / ไม่ใช่ Retail + เติม Lat/Lon (จับด้วย ShipTo Name แบบเดียวกับแท็บประมวลผลไฟล์)
     Retail ดูจาก Channel ใน Master (คอลัมน์ C) ตาม ShipTo Name; ถ้าไม่เจอชื่อใน Master เลย
     ใช้ Cust Type ในไฟล์แทน (R = Retail) แล้วนับไว้รายงาน
-    ออเดอร์ที่ Route เป็น InterExp / IE,B&W แยกไปชีทของตัวเองก่อนเสมอ (ไม่ว่าจะเป็น Retail หรือไม่)
-    ที่เหลือค่อยแบ่ง Retail / ไม่ใช่ Retail
-    Returns (normal_df, retail_df, carrier_df, info)"""
+    ลำดับการแยกชีท:
+      1) Route เป็น InterExp / IE,B&W -> ชีท InterExp-B&W เสมอ (ไม่ว่าจะเป็น Retail หรือไม่)
+      2) ช่อง Cust Type ในไฟล์ว่าง -> ชีท No Cust Type (เก็บไว้ให้คนตรวจ ไม่เดาว่าเป็นประเภทไหน)
+      3) ที่เหลือแบ่ง Retail / ไม่ใช่ Retail
+    Returns (normal_df, retail_df, carrier_df, notype_df, info)"""
     df = orders.copy()
     if dates is not None:
         keep = set(str(d) for d in dates)
@@ -2013,25 +2025,31 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None):
     df = df.sort_values(['_rk', '_ck', '_ok'], kind='stable')
 
     df['_carrier'] = df['Route'].map(_bkk_is_carrier_route)
-    normal = df[~df['_carrier'] & ~df['_retail']][BKK_COLUMNS].reset_index(drop=True)
-    retail = df[~df['_carrier'] & df['_retail']][BKK_COLUMNS].reset_index(drop=True)
+    df['_notype'] = df['Cust Type'].map(_cell_blank) & ~df['_carrier']
+    rest = ~df['_carrier'] & ~df['_notype']
+    normal = df[rest & ~df['_retail']][BKK_COLUMNS].reset_index(drop=True)
+    retail = df[rest & df['_retail']][BKK_COLUMNS].reset_index(drop=True)
     carrier = df[df['_carrier']][BKK_COLUMNS].reset_index(drop=True)
+    notype = df[df['_notype']][BKK_COLUMNS].reset_index(drop=True)
     # คอลัมน์ Route ในไฟล์ผลลัพธ์ปล่อยว่างไว้ให้คนจัดกรอกเอง (Route จาก Sheet1 ใช้แค่แยกชีทกับเรียงลำดับ)
-    for part in (normal, retail, carrier):
+    for part in (normal, retail, carrier, notype):
         part['Route'] = None
     out_info = dict(info)
     out_info.update({
         'selected_orders': len(df), 'normal': len(normal), 'retail': len(retail), 'carrier': len(carrier),
+        'notype': len(notype), 'coords_notype': int(notype['Latitude'].notna().sum()),
+        'carrier_notype': int((df['_carrier'] & df['Cust Type'].map(_cell_blank)).sum()),
         'carrier_retail': int((df['_carrier'] & df['_retail']).sum()),
         'retail_by_cust_type': by_cust_type, 'forced_fs': forced_fs,
         'coords_normal': int(normal['Latitude'].notna().sum()), 'coords_retail': int(retail['Latitude'].notna().sum()),
         'coords_carrier': int(carrier['Latitude'].notna().sum()),
     })
-    return normal, retail, carrier, out_info
+    return normal, retail, carrier, notype, out_info
 
 
-def bkk_to_excel_bytes(normal_df, retail_df, carrier_df):
-    """3 ชีท (Order / Retail / InterExp-B&W) หน้าตาเดียวกับใบงาน Sheet2: หัวกระดาษ ทะเบียนรถ/วันที่/เลขไมล์,
+def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None):
+    """ชีท Order / Retail / InterExp-B&W (+ No Cust Type ถ้ามีออเดอร์ที่ช่อง Cust Type ว่าง)
+    หน้าตาเดียวกับใบงาน Sheet2: หัวกระดาษ ทะเบียนรถ/วันที่/เลขไมล์,
     หัวตารางแถว 4, ฟอนต์ Cordia New, เส้นขอบทุกช่อง + Lat/Lon ต่อท้าย"""
     wb = Workbook()
     wb.remove(wb.active)
@@ -2042,7 +2060,10 @@ def bkk_to_excel_bytes(normal_df, retail_df, carrier_df):
     f_body = Font(name='Cordia New', size=14)
     center_cols = {'Cust Type', 'Route'}
 
-    for title, df in (('Order', normal_df), ('Retail', retail_df), (BKK_CARRIER_SHEET, carrier_df)):
+    sheets = [('Order', normal_df), ('Retail', retail_df), (BKK_CARRIER_SHEET, carrier_df)]
+    if notype_df is not None and len(notype_df):
+        sheets.append((BKK_NOTYPE_SHEET, notype_df))
+    for title, df in sheets:
         ws = wb.create_sheet(title=title)
         ws['B1'] = 'ทะเบียนรถ____________________'
         ws['F1'] = 'วันที่______________________'
@@ -2088,7 +2109,8 @@ with tab_bkk:
     st.markdown("##### 🏙️ For BKK — ทำใบงานจาก Sheet1")
     st.caption("อัพโหลดไฟล์ route (ใช้เฉพาะ Sheet1) ระบบจะตัดแถวว่าง ยุบให้เหลือ 1 แถวต่อ 1 OrderNo "
                "แยก Route InterExp / IE,B&W ไปชีทหนึ่ง แยก Retail ไปอีกชีท (ดู Channel ใน Master จาก ShipTo Name) "
-               "แล้วเติม Lat/Lon ให้ ได้ไฟล์เดียว 3 ชีท: Order, Retail, InterExp-B&W หน้าตาเหมือนใบงาน Sheet2")
+               "แล้วเติม Lat/Lon ให้ ได้ไฟล์เดียว: Order, Retail, InterExp-B&W หน้าตาเหมือนใบงาน Sheet2 "
+               "(ออเดอร์ที่ช่อง Cust Type ว่างจะถูกเก็บไว้ในชีท No Cust Type ไม่ลบทิ้ง)")
 
     bkk_file = st.file_uploader("อัพโหลดไฟล์ route", type=['xls', 'xlsx'], label_visibility="collapsed", key="bkk_uploader")
 
@@ -2125,11 +2147,11 @@ with tab_bkk:
             with st.spinner("🛰️ กำลังแยก Retail และเติมพิกัด..."):
                 try:
                     bkk_channels = load_master_channels(MASTER_SHEET_CSV_URL)
-                    bkk_normal, bkk_retail, bkk_carrier, bkk_result = process_bkk_orders(
+                    bkk_normal, bkk_retail, bkk_carrier, bkk_notype, bkk_result = process_bkk_orders(
                         bkk_orders, bkk_info, master_df, bkk_channels,
                         dates=bkk_sel_dates if len(bkk_dates) > 1 else None,
                     )
-                    st.session_state['bkk_xlsx'] = bkk_to_excel_bytes(bkk_normal, bkk_retail, bkk_carrier)
+                    st.session_state['bkk_xlsx'] = bkk_to_excel_bytes(bkk_normal, bkk_retail, bkk_carrier, bkk_notype)
                     st.session_state['bkk_result'] = bkk_result
                     st.session_state['bkk_filename'] = bkk_file.name
                 except Exception as e:
@@ -2140,11 +2162,11 @@ with tab_bkk:
             res = st.session_state['bkk_result']
             st.markdown(f"""
             <div class="rcm-card rcm-card-success">
-                🎯 <b>เสร็จแล้ว!</b> {res['selected_orders']:,} ออเดอร์ → Order {res['normal']:,} + Retail {res['retail']:,} + InterExp/B&W {res['carrier']:,}
+                🎯 <b>เสร็จแล้ว!</b> {res['selected_orders']:,} ออเดอร์ → Order {res['normal']:,} + Retail {res['retail']:,} + InterExp/B&W {res['carrier']:,} + ไม่มี Cust Type {res['notype']:,}
             </div>
             """, unsafe_allow_html=True)
 
-            bc1, bc2, bc3 = st.columns(3)
+            bc1, bc2, bc3, bc4 = st.columns(4)
             with bc1:
                 stat_box("SHEET: Order", f"{res['normal']:,}",
                           f"มีพิกัด {res['coords_normal']:,} / {res['normal']:,}")
@@ -2154,10 +2176,17 @@ with tab_bkk:
             with bc3:
                 stat_box("SHEET: InterExp-B&W", f"{res['carrier']:,}",
                           f"มีพิกัด {res['coords_carrier']:,} / {res['carrier']:,} · เป็น Retail {res['carrier_retail']:,}")
+            with bc4:
+                stat_box("SHEET: No Cust Type", f"{res['notype']:,}",
+                          f"มีพิกัด {res['coords_notype']:,} / {res['notype']:,}" if res['notype'] else "ไม่มี — ไม่สร้างชีทนี้")
 
             bkk_notes = []
             if res['retail_by_cust_type']:
                 bkk_notes.append(f"{res['retail_by_cust_type']:,} ออเดอร์ไม่เจอ ShipTo Name ใน Master — แยก Retail จาก Cust Type ในไฟล์แทน (R = Retail)")
+            if res['notype']:
+                bkk_notes.append(f"{res['notype']:,} ออเดอร์ช่อง Cust Type ว่าง — แยกไว้ในชีท {BKK_NOTYPE_SHEET} ให้ตรวจเอง (ไม่ได้ลบ และไม่ได้เดาประเภท)")
+            if res.get('carrier_notype'):
+                bkk_notes.append(f"{res['carrier_notype']:,} ออเดอร์ในชีท {BKK_CARRIER_SHEET} ช่อง Cust Type ว่าง (อยู่ชีทนั้นตาม Route)")
             if res.get('forced_fs'):
                 bkk_notes.append(f"{res['forced_fs']:,} ออเดอร์ของ {', '.join(BKK_FORCE_FOOD_SERVICE)} ถูกเปลี่ยนเป็น F (Food Service) ตามที่ตั้งไว้")
             if res['multi_route']:
@@ -2171,7 +2200,7 @@ with tab_bkk:
 
             st.write("")
             st.download_button(
-                "⬇️ ดาวน์โหลดใบงาน For BKK (Excel 3 ชีท: Order + Retail + InterExp-B&W)",
+                "⬇️ ดาวน์โหลดใบงาน For BKK (Excel: Order + Retail + InterExp-B&W + No Cust Type)",
                 data=st.session_state['bkk_xlsx'],
                 file_name=f"{bkk_file.name.rsplit('.', 1)[0]}_For_BKK.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
