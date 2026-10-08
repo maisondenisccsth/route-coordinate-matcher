@@ -2031,9 +2031,7 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None):
     retail = df[rest & df['_retail']][BKK_COLUMNS].reset_index(drop=True)
     carrier = df[df['_carrier']][BKK_COLUMNS].reset_index(drop=True)
     notype = df[df['_notype']][BKK_COLUMNS].reset_index(drop=True)
-    # คอลัมน์ Route ในไฟล์ผลลัพธ์ปล่อยว่างไว้ให้คนจัดกรอกเอง (Route จาก Sheet1 ใช้แค่แยกชีทกับเรียงลำดับ)
-    for part in (normal, retail, carrier, notype):
-        part['Route'] = None
+    # คอลัมน์ Route ในไฟล์ผลลัพธ์ = Route จากคอลัมน์ A ของ Sheet1 (ออเดอร์ที่มีหลาย Route ใช้ Route แรกที่เจอ)
     out_info = dict(info)
     out_info.update({
         'selected_orders': len(df), 'normal': len(normal), 'retail': len(retail), 'carrier': len(carrier),
