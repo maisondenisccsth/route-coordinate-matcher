@@ -1855,10 +1855,16 @@ BKK_FOOTER_NOTES = [
     'ถึงพนักงานขับรถ ถ้าในรูทมี สินค้า 4AOB ทุกตัว ให้เอากล่องสินค้าแพ็คลงกล่องโฟม และใส่ดรายไอซ์กล่องละ 2 ก้อน ก่อนนำสินค้าไปส่งลูกค้า เพราะขนมเสียหายง่ายต้อง ***',
     'ถึงพนักงานขับรถ ถ้าในรูทมี สินค้า 4HFF ทุกตัว ให้เอากล่องสินค้าแพ็คลงกล่องโฟม และใส่ดรายไอซ์กล่องละ 2 ก้อน ก่อนนำสินค้าไปส่งลูกค้า เพราะสินค้าเสียหายง่ายต้อง ***',
 ]
+# น้ำหนักต่อออเดอร์ (รวมจากทุกรายการสินค้าใน Sheet1 + Product Master) และจำนวนสินค้าที่ต้องใช้ Dry Ice
+BKK_WEIGHT_COL = 'น้ำหนัก (kg)'
+BKK_AOB_COL = '4AOB (กล่อง)'
+BKK_HFF_COL = '4HFF (PCS)'
+BKK_DRYICE_GROUPS = (('4AOB', BKK_AOB_COL), ('4HFF', BKK_HFF_COL))  # Product Code ขึ้นต้นด้วย -> คอลัมน์
 BKK_COLUMNS = ['Order Date', 'OrderNo', 'Customers Code', 'Cust Type', 'Customer Name', 'ShipTo Name',
-               'ShipTo.Address', 'Route', 'Remark', 'เวลาเข้า', 'เวลาออก', BKK_SERVICE_COL, 'Latitude', 'Longitude']
-# ความกว้างคอลัมน์ลอกจากใบงาน Sheet2 ที่ทีมใช้อยู่จริง (A..K) + Lat/Lon
-BKK_COL_WIDTHS = [9.9, 39.1, 14.4, 9.1, 53.3, 53.7, 40.1, 19.4, 27.4, 7.7, 8.6, 15.5, 12.5, 12.5]
+               'ShipTo.Address', 'Route', 'Remark', 'เวลาเข้า', 'เวลาออก', BKK_SERVICE_COL,
+               BKK_WEIGHT_COL, BKK_AOB_COL, BKK_HFF_COL, 'Latitude', 'Longitude']
+# ความกว้างคอลัมน์ลอกจากใบงาน Sheet2 ที่ทีมใช้อยู่จริง (A..K) + Service Time + น้ำหนัก/4AOB/4HFF + Lat/Lon
+BKK_COL_WIDTHS = [9.9, 39.1, 14.4, 9.1, 53.3, 53.7, 40.1, 19.4, 27.4, 7.7, 8.6, 15.5, 12, 12, 11, 12.5, 12.5]
 
 
 def build_channel_map(df):
@@ -1924,6 +1930,9 @@ def read_bkk_orders(file_bytes):
     if c_addr is None:
         c_addr = col('shipto.c')
     c_route = col('route')
+    c_prod = col('product code')
+    c_qty = col('qty')
+    c_unit = col('units', 'unit', 'uom')
 
     def get(row, c):
         if c is None or c >= len(row) or _cell_blank(row[c]):
@@ -1931,7 +1940,7 @@ def read_bkk_orders(file_bytes):
         v = row[c]
         return v.strip() if isinstance(v, str) else v
 
-    rows, seen, multi_route = [], {}, {}
+    rows, seen, multi_route, lines = [], {}, {}, []
     line_count = no_order_rows = 0
     for row in raw[header_row + 1:]:
         if all(_cell_blank(v) for v in row):
@@ -1942,6 +1951,10 @@ def read_bkk_orders(file_bytes):
         line_count += 1
         order_no = _bkk_clean_key(row[c_order])
         route = _bkk_clean_key(get(row, c_route))
+        if get(row, c_prod) is not None:
+            # เก็บรายการสินค้าไว้คิดน้ำหนัก / นับ 4AOB 4HFF ต่อออเดอร์
+            lines.append({'OrderNo': order_no, 'Product Code': str(get(row, c_prod)).strip(),
+                          'Qty': get(row, c_qty), 'Units': get(row, c_unit)})
         if order_no in seen:
             first = seen[order_no]
             if route != first['Route'] and route is not None and first['Route'] is not None:
@@ -1967,7 +1980,8 @@ def read_bkk_orders(file_bytes):
 
     orders = pd.DataFrame(rows, columns=BKK_COLUMNS[:8])
     info = {'sheet': sheet, 'lines': line_count, 'orders': len(orders), 'no_order_rows': no_order_rows,
-            'multi_route': multi_route, 'has_shipto_col': c_sname is not None}
+            'multi_route': multi_route, 'has_shipto_col': c_sname is not None,
+            'lines_df': pd.DataFrame(lines, columns=['OrderNo', 'Product Code', 'Qty', 'Units'])}
     return orders, info
 
 
@@ -1996,7 +2010,207 @@ def _bkk_is_carrier_route(route):
     return key.startswith('INTEREXP') or key in ('IEBW', 'BW', 'IE')
 
 
-def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service_minutes=15, retail_service_minutes=45):
+# ---------------- น้ำหนัก + Dry Ice (For BKK) ----------------
+BKK_WEIGHT_BAD_UNIT = 'น้ำหนักต่อชิ้นใน Master ผิดปกติ (ไม่นับเข้ายอด)'
+
+
+def _bkk_num(v):
+    try:
+        f = float(v)
+        return f if f == f else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _bkk_size_kg(s):
+    """SIZE ใน Product Master -> kg ต่อชิ้น: '425 g' -> 0.425, '2.5 kg' -> 2.5, '900 ml' -> 0.9"""
+    if not isinstance(s, str):
+        return None
+    m = re.search(r'([\d.]+)\s*(kg|g|gr|ml|l|lt|ltr|cl)\b', s.lower())
+    if not m:
+        return None
+    try:
+        v = float(m.group(1))
+    except ValueError:
+        return None
+    u = m.group(2)
+    return v if u in ('kg', 'l', 'lt', 'ltr') else v / 1000 if u in ('g', 'gr', 'ml') else v / 100
+
+
+def bkk_line_weight(qty, unit, prod):
+    """น้ำหนัก 1 รายการสินค้า -> (kg หรือ None, สถานะ)
+    PCS   : Qty x Unit Net Wt (ถ้า Master ไม่มี Unit Net Wt ใช้ SIZE แทน)
+    KG    : Qty คือ kg อยู่แล้ว
+    CTN.. : Qty x UNIT per PACK x SIZE (CTN060 / CTN080 = ลังละ 60 / 80 ชิ้น)
+    1KG1P : 1 แพ็ค = 1 kg
+    น้ำหนักต่อชิ้นที่ต่างจาก SIZE เกิน 2.5 เท่า (เช่น 990 kg/ชิ้น) ไม่นับเข้ายอด กันยอดรวมเพี้ยน"""
+    q = _bkk_num(qty)
+    u = str(unit).strip().upper() if unit is not None else ''
+    if q is None:
+        return None, 'Qty ไม่ใช่ตัวเลข'
+    if u == 'KG':
+        return q, 'คำนวณได้'
+    if prod is None:
+        return None, 'ไม่พบ Product Code ใน Product Master'
+    size = _bkk_size_kg(prod.get('SIZE'))
+    if u == '1KG1P':
+        return q * 1.0, 'คำนวณได้ (1KG1P = 1 kg)'
+    if re.fullmatch(r'CTN\d*', u):
+        n = _bkk_num(prod.get('UNIT per PACK'))
+        if n and size:
+            return q * n * size, 'คำนวณได้ (CTN: ชิ้นต่อลัง x SIZE)'
+        return None, 'CTN: Master ไม่มี UNIT per PACK หรือ SIZE'
+    if u == 'PCS':
+        uw = _bkk_num(prod.get('Unit Net Wt (kg)'))
+        if uw is None or uw <= 0:
+            if size:
+                return q * size, 'ประมาณจาก SIZE (Master ไม่มี Unit Net Wt)'
+            return None, 'Master ไม่มี Unit Net Wt และ SIZE'
+        if size and (uw / size > 2.5 or uw / size < 0.4):
+            return None, BKK_WEIGHT_BAD_UNIT
+        return q * uw, 'คำนวณได้'
+    return None, f'หน่วย "{unit}" ยังไม่รองรับ'
+
+
+def bkk_weigh_lines(lines_df, product_df):
+    """เติม kg / สถานะ / กลุ่ม Dry Ice ให้ทุกรายการสินค้า (product_df=None -> ไม่คิดน้ำหนัก แต่ยังนับ 4AOB/4HFF ได้)"""
+    lines = lines_df.copy()
+    lines['Qty'] = pd.to_numeric(lines['Qty'], errors='coerce')
+    code = lines['Product Code'].astype(str).str.strip().str.upper()
+    grp = pd.Series([None] * len(lines), index=lines.index, dtype=object)
+    for prefix, _ in BKK_DRYICE_GROUPS:
+        grp[code.str.startswith(prefix)] = prefix
+    lines['กลุ่ม'] = grp
+    if product_df is None:
+        lines['kg'] = None
+        lines['kg_raw'] = None
+        lines['สถานะ'] = 'ไม่ได้โหลด Product Master'
+        lines['in_master'] = None
+        return lines
+    pm = {}
+    for rec in product_df.to_dict('records'):
+        k = str(rec.get('SKUCode', '')).strip().upper()
+        if k and k not in pm:
+            pm[k] = rec
+    kgs, raws, sts = [], [], []
+    for c, q, u in zip(code, lines['Qty'], lines['Units']):
+        kg, st_ = bkk_line_weight(q, u, pm.get(c))
+        raw = None
+        if st_ == BKK_WEIGHT_BAD_UNIT:  # เก็บค่าที่คำนวณได้ไว้โชว์ในรายการตรวจ แต่ไม่นับเข้ายอด
+            uw = _bkk_num(pm[c].get('Unit Net Wt (kg)'))
+            raw = q * uw if (uw is not None and q == q) else None
+        kgs.append(kg)
+        raws.append(kg if kg is not None else raw)
+        sts.append(st_)
+    lines['kg'] = pd.to_numeric(pd.Series(kgs, index=lines.index), errors='coerce')
+    lines['kg_raw'] = pd.to_numeric(pd.Series(raws, index=lines.index), errors='coerce')
+    lines['สถานะ'] = sts
+    lines['in_master'] = [c in pm for c in code]
+    return lines
+
+
+def _bkk_show(df):
+    """Route มีทั้งเลขและตัวหนังสือ (1, 2, HH, PTY) -> แปลงเป็นข้อความก่อนโชว์ในตาราง"""
+    out = df.copy()
+    for c in ('Route', 'OrderNo'):
+        if c in out.columns:
+            out[c] = out[c].astype(str)
+    return out
+
+
+def bkk_summaries(sheets, lines):
+    """sheets = [(ชื่อชีท, df), ...] ของใบงาน For BKK, lines = ผลจาก bkk_weigh_lines (เฉพาะออเดอร์ที่อยู่ในใบงาน)
+    Returns dict ของตาราง: dry_route, dry_lines, weight_route, weight_sheet, bad_lines"""
+    route_of, sheet_of = {}, {}
+    for name, df in sheets:
+        for o, r in zip(df['OrderNo'], df['Route']):
+            route_of[o] = r
+            sheet_of[o] = name
+    lines = lines[lines['OrderNo'].isin(route_of)].copy()
+    lines['Route'] = lines['OrderNo'].map(route_of)
+    lines['ชีท'] = lines['OrderNo'].map(sheet_of)
+    routes = sorted(set(route_of.values()), key=_bkk_route_sort_key)
+    has_weight = lines['kg_raw'].notna().any() or lines['สถานะ'].ne('ไม่ได้โหลด Product Master').any()
+
+    dry = lines[lines['กลุ่ม'].notna()]
+    dry_rows = []
+    for rt in routes:
+        g = dry[dry['Route'] == rt]
+        if g.empty:
+            continue
+        vals = [float(g.loc[g['กลุ่ม'] == p, 'Qty'].sum()) for p, _ in BKK_DRYICE_GROUPS]
+        dry_rows.append([rt, int(g['OrderNo'].nunique())] + vals + [sum(vals)])
+    dry_cols = ['Route', 'จำนวนออเดอร์'] + [f'{p} (Qty)' for p, _ in BKK_DRYICE_GROUPS] + ['รวม (Qty)']
+    dry_route = pd.DataFrame(dry_rows, columns=dry_cols)
+    if len(dry_route):
+        tot = ['รวมทั้งหมด', int(dry['OrderNo'].nunique())] + [float(dry_route[c].sum()) for c in dry_cols[2:]]
+        dry_route = pd.concat([dry_route, pd.DataFrame([tot], columns=dry_cols)], ignore_index=True)
+    dry_lines = dry.assign(_rk=dry['Route'].map(_bkk_route_sort_key)).sort_values(['_rk', 'OrderNo'], kind='stable')[
+        ['Route', 'OrderNo', 'ชีท', 'กลุ่ม', 'Product Code', 'Qty', 'Units']].reset_index(drop=True)
+
+    w_rows = []
+    for rt in routes:
+        g = lines[lines['Route'] == rt]
+        miss = int(g['kg'].isna().sum())
+        w_rows.append([rt, int(g['OrderNo'].nunique()), round(float(g['kg'].sum()), 2), len(g), miss,
+                       'ครบ' if miss == 0 else f'ขาด {miss} รายการ'])
+    miss = int(lines['kg'].isna().sum())
+    w_rows.append(['รวมทั้งหมด', int(lines['OrderNo'].nunique()), round(float(lines['kg'].sum()), 2), len(lines), miss,
+                   'ครบ' if miss == 0 else f'ขาด {miss} รายการ'])
+    weight_route = pd.DataFrame(w_rows, columns=['Route', 'จำนวนออเดอร์', 'น้ำหนักรวม (kg)', 'จำนวนรายการ', 'คิดไม่ได้', 'สถานะ'])
+
+    s_rows = []
+    for name, df in sheets:
+        if len(df):
+            g = lines[lines['ชีท'] == name]
+            s_rows.append([name, len(df), round(float(g['kg'].sum()), 2)])
+    s_rows.append(['รวมทั้งหมด', sum(r[1] for r in s_rows), round(float(lines['kg'].sum()), 2)])
+    weight_sheet = pd.DataFrame(s_rows, columns=['ชีท', 'จำนวนออเดอร์', 'น้ำหนักรวม (kg)'])
+
+    bad = lines[lines['kg'].isna()]
+    bad_lines = bad.assign(_rk=bad['Route'].map(_bkk_route_sort_key)).sort_values(['_rk', 'OrderNo'], kind='stable')[
+        ['Route', 'OrderNo', 'Product Code', 'Qty', 'Units', 'kg_raw', 'สถานะ']].rename(
+        columns={'kg_raw': 'kg ที่คำนวณได้ (ไม่นับ)', 'สถานะ': 'สาเหตุ'}).reset_index(drop=True)
+    # Product Code ที่ไม่มีใน Product Master (1 แถวต่อ 1 รหัส) ไว้ดาวน์โหลดไปเพิ่มใน Master
+    nf = lines[lines['in_master'] == False].copy()  # noqa: E712 (None = ไม่ได้โหลด Master)
+    mc_rows = []
+    if len(nf):
+        nf['_code'] = nf['Product Code'].astype(str).str.strip().str.upper()
+        nf['_rk'] = nf['Route'].map(_bkk_route_sort_key)
+        for code_, g in nf.sort_values(['_rk', 'OrderNo'], kind='stable').groupby('_code', sort=False):
+            mc_rows.append({
+                'Product Code': g['Product Code'].iloc[0],
+                'Units': ', '.join(dict.fromkeys(str(u) for u in g['Units'] if not _cell_blank(u))),
+                'จำนวนรายการ': len(g),
+                'Qty รวม': float(g['Qty'].sum()),
+                'จำนวนออเดอร์': int(g['OrderNo'].nunique()),
+                'OrderNo': ', '.join(dict.fromkeys(str(o) for o in g['OrderNo'])),
+                'Route': ', '.join(dict.fromkeys(str(r) for r in g['Route'])),
+                'พบเมื่อ': datetime.now().strftime('%Y-%m-%d'),
+            })
+    missing_codes = pd.DataFrame(mc_rows, columns=['Product Code', 'Units', 'จำนวนรายการ', 'Qty รวม', 'จำนวนออเดอร์',
+                                                   'OrderNo', 'Route', 'พบเมื่อ'])
+    return {'dry_route': dry_route, 'dry_lines': dry_lines, 'weight_route': weight_route,
+            'weight_sheet': weight_sheet, 'bad_lines': bad_lines, 'has_weight': bool(has_weight),
+            'missing_orders': set(bad['OrderNo']), 'missing_codes': missing_codes}
+
+
+def bkk_missing_codes_to_excel_bytes(df):
+    """ไฟล์ Product Code ที่ไม่เจอใน Product Master"""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Product Code ไม่เจอ', index=False)
+        ws = writer.sheets['Product Code ไม่เจอ']
+        for i, w in enumerate([16, 10, 13, 10, 14, 40, 22, 12], start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        ws.freeze_panes = 'A2'
+    return output.getvalue()
+
+
+def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service_minutes=15, retail_service_minutes=45,
+                       product_df=None):
     """แยก Retail / ไม่ใช่ Retail + เติม Lat/Lon (จับด้วย ShipTo Name แบบเดียวกับแท็บประมวลผลไฟล์)
     Retail ดูจาก Channel ใน Master (คอลัมน์ C) ตาม ShipTo Name; ถ้าไม่เจอชื่อใน Master เลย
     ใช้ Cust Type ในไฟล์แทน (R = Retail) แล้วนับไว้รายงาน
@@ -2043,6 +2257,16 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service
     df['เวลาเข้า'] = None
     df['เวลาออก'] = None
     df[BKK_SERVICE_COL] = None
+    # น้ำหนักต่อออเดอร์ = ผลรวม kg ทุกรายการสินค้าของออเดอร์นั้นใน Sheet1 / 4AOB 4HFF = ผลรวม Qty (1 = 1 ไม่หาร)
+    lines_df = info.get('lines_df')
+    if lines_df is None:
+        lines_df = pd.DataFrame(columns=['OrderNo', 'Product Code', 'Qty', 'Units'])
+    weighed = bkk_weigh_lines(lines_df[lines_df['OrderNo'].isin(set(df['OrderNo']))], product_df)
+    by_order = weighed.groupby('OrderNo')
+    df[BKK_WEIGHT_COL] = df['OrderNo'].map(by_order['kg'].sum(min_count=1)).round(2) if product_df is not None else None
+    for prefix, col_name in BKK_DRYICE_GROUPS:
+        g = weighed[weighed['กลุ่ม'] == prefix].groupby('OrderNo')['Qty'].sum()
+        df[col_name] = df['OrderNo'].map(g)
     df['Latitude'] = lats
     df['Longitude'] = lons
     df['_retail'] = is_retail
@@ -2078,7 +2302,9 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service
         'retail_by_cust_type': by_cust_type, 'forced_fs': forced_fs, 'service_minutes': service_minutes, 'retail_service_minutes': retail_service_minutes,
         'coords_normal': int(normal['Latitude'].notna().sum()), 'coords_retail': int(retail['Latitude'].notna().sum()),
         'coords_carrier': int(carrier['Latitude'].notna().sum()),
+        'weighed_lines': weighed,
     })
+    out_info.pop('lines_df', None)
     return normal, retail, carrier, notype, out_info
 
 
@@ -2092,7 +2318,65 @@ def bkk_sheet1_clean(file_bytes):
     return raw.loc[~blank.all(axis=1), ~blank.all(axis=0)].reset_index(drop=True)
 
 
-def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_df=None):
+def _bkk_write_summary_sheets(wb, summary):
+    """ชีท 'สรุป Dry Ice' และ 'สรุปน้ำหนัก' ต่อท้ายใบงาน"""
+    thin = Side(style='thin')
+    bd = Border(top=thin, bottom=thin, left=thin, right=thin)
+    fh = Font(name='Cordia New', size=14, bold=True)
+    fb = Font(name='Cordia New', size=14)
+    ft = Font(name='Cordia New', size=16, bold=True)
+
+    def table(ws, top, df, bold_last=False):
+        for c, h in enumerate(df.columns, 1):
+            x = ws.cell(row=top, column=c, value=h)
+            x.font, x.border = fh, bd
+            x.alignment = Alignment(horizontal='center')
+        for i, rec in enumerate(df.itertuples(index=False), top + 1):
+            for c, v in enumerate(rec, 1):
+                if v is not None and isinstance(v, float) and pd.isna(v):
+                    v = None
+                x = ws.cell(row=i, column=c, value=v)
+                x.font, x.border = fb, bd
+                if isinstance(v, float):
+                    x.number_format = '#,##0.00' if v != int(v) else '#,##0'
+        if bold_last and len(df):
+            for c in range(1, len(df.columns) + 1):
+                ws.cell(row=top + len(df), column=c).font = fh
+        return top + 1 + len(df)
+
+    ws = wb.create_sheet(title='สรุป Dry Ice')
+    ws['A1'] = 'สรุปสินค้า 4AOB / 4HFF (สำหรับเตรียม Dry Ice)'
+    ws['A1'].font = ft
+    if len(summary['dry_route']):
+        ws['A3'] = 'ต่อ Route  (Qty 1 = 1 ไม่หาร)'
+        ws['A3'].font = fh
+        end = table(ws, 4, summary['dry_route'], bold_last=True)
+        ws.cell(row=end + 1, column=1, value='ต่อออเดอร์').font = fh
+        table(ws, end + 2, summary['dry_lines'])
+    else:
+        ws['A3'] = 'ไม่มีสินค้า 4AOB / 4HFF ในไฟล์นี้'
+        ws['A3'].font = fb
+    for c, wd in enumerate([16, 14, 16, 14, 14, 14, 12], 1):
+        ws.column_dimensions[get_column_letter(c)].width = wd
+
+    if not summary.get('has_weight'):
+        return
+    ws = wb.create_sheet(title='สรุปน้ำหนัก')
+    ws['A1'] = 'น้ำหนักต่อ Route (คำนวณจาก Sheet1 + Product Master)'
+    ws['A1'].font = ft
+    ws['A2'] = 'ต่อ Route'
+    ws['A2'].font = fh
+    end = table(ws, 3, summary['weight_route'], bold_last=True)
+    ws.cell(row=end + 1, column=1, value='ต่อชีท').font = fh
+    end = table(ws, end + 2, summary['weight_sheet'], bold_last=True)
+    if len(summary['bad_lines']):
+        ws.cell(row=end + 1, column=1, value='รายการที่คิดน้ำหนักไม่ได้ (ไม่ได้นับเข้ายอด)').font = fh
+        table(ws, end + 2, summary['bad_lines'])
+    for c, wd in enumerate([16, 14, 18, 14, 12, 22, 45], 1):
+        ws.column_dimensions[get_column_letter(c)].width = wd
+
+
+def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_df=None, summary=None):
     """ชีท Order / Retail / InterExp-B&W (+ No Cust Type ถ้ามีออเดอร์ที่ช่อง Cust Type ว่าง)
     หน้าตาเดียวกับใบงาน Sheet2: หัวกระดาษ ทะเบียนรถ/วันที่/เลขไมล์,
     หัวตารางแถว 4, ฟอนต์ Cordia New, เส้นขอบทุกช่อง + Lat/Lon ต่อท้าย"""
@@ -2104,6 +2388,12 @@ def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_
     f_head = Font(name='Cordia New', size=14, bold=True, underline='single')
     f_body = Font(name='Cordia New', size=14)
     center_cols = {'Cust Type', 'Route'}
+    f_bold = Font(name='Cordia New', size=14, bold=True)
+    fill_warn = PatternFill('solid', fgColor='FFE699')  # น้ำหนักไม่ครบ (มีรายการที่คิดไม่ได้)
+    fill_ice = PatternFill('solid', fgColor='DDEBF7')   # ออเดอร์ที่มี 4AOB / 4HFF
+    missing_orders = summary['missing_orders'] if summary and summary.get('has_weight') else set()
+    w_idx = BKK_COLUMNS.index(BKK_WEIGHT_COL) + 1
+    ice_idx = [BKK_COLUMNS.index(c) + 1 for _, c in BKK_DRYICE_GROUPS]
 
     # Sheet1 ต้นฉบับ (ตัดแถว/คอลัมน์ว่างแล้ว) เก็บไว้เป็นชีทแรก
     if sheet1_df is not None and len(sheet1_df):
@@ -2149,7 +2439,23 @@ def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_
                 cell.font = f_body
                 cell.border = border
                 cell.alignment = Alignment(horizontal='center' if name in center_cols else 'left', vertical='center')
+                if name == BKK_WEIGHT_COL:
+                    cell.number_format = '#,##0.00'
+                    if rec.OrderNo in missing_orders:
+                        cell.fill = fill_warn
+                elif c in ice_idx and v is not None:
+                    cell.fill = fill_ice
             ws.row_dimensions[i].height = 21.75
+
+        # แถวรวมใต้คอลัมน์น้ำหนัก / 4AOB / 4HFF
+        if len(df):
+            tr = 5 + len(df)
+            ws.cell(row=tr, column=w_idx - 1, value='รวม').font = f_bold
+            for c in [w_idx] + ice_idx:
+                L = get_column_letter(c)
+                x = ws.cell(row=tr, column=c, value=f'=SUM({L}5:{L}{tr - 1})')
+                x.font = f_bold
+                x.number_format = '#,##0.00' if c == w_idx else 'General'
 
         # ท้ายใบงาน: เว้น 2 แถว แล้วช่องลงชื่อคนขับ + หมายเหตุถึงคนขับ
         foot = 5 + len(df) + 2
@@ -2167,6 +2473,8 @@ def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
         ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    # สรุป Dry Ice / น้ำหนัก แสดงบนหน้าแอพอย่างเดียว ไม่ใส่เป็นชีทในไฟล์ (ตามที่ผู้ใช้ขอ)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -2217,18 +2525,33 @@ def _render_bkk():
         bkk_clicked = st.button("🚀 ทำใบงาน For BKK", type="primary", use_container_width=True, key="bkk_btn")
 
         if bkk_clicked:
-            with st.spinner("🛰️ กำลังแยก Retail และเติมพิกัด..."):
+            with st.spinner("🛰️ กำลังแยก Retail เติมพิกัด และคิดน้ำหนัก..."):
                 try:
                     master_df = load_master_data(MASTER_SHEET_CSV_URL)
                     bkk_channels = load_master_channels(MASTER_SHEET_CSV_URL)
+                    bkk_product, bkk_product_err = None, None
+                    if PRODUCT_SHEET_CSV_URL:
+                        try:
+                            bkk_product = load_product_master(PRODUCT_SHEET_CSV_URL)
+                        except Exception as pe:
+                            bkk_product_err = str(pe)
+                    else:
+                        bkk_product_err = 'ยังไม่ได้ตั้งค่า PRODUCT_SHEET_CSV_URL'
                     bkk_normal, bkk_retail, bkk_carrier, bkk_notype, bkk_result = process_bkk_orders(
                         bkk_orders, bkk_info, master_df, bkk_channels,
                         dates=bkk_sel_dates if len(bkk_dates) > 1 else None,
                         service_minutes=float(bkk_service),
                         retail_service_minutes=float(bkk_service_retail),
+                        product_df=bkk_product,
                     )
+                    bkk_sheets = [('Order', bkk_normal), ('Retail', bkk_retail), (BKK_CARRIER_SHEET, bkk_carrier),
+                                  (BKK_NOTYPE_SHEET, bkk_notype)]
+                    bkk_summary = bkk_summaries(bkk_sheets, bkk_result['weighed_lines'])
                     st.session_state['bkk_xlsx'] = bkk_to_excel_bytes(bkk_normal, bkk_retail, bkk_carrier, bkk_notype,
-                                                                      sheet1_df=bkk_sheet1_clean(bkk_bytes))
+                                                                      sheet1_df=bkk_sheet1_clean(bkk_bytes),
+                                                                      summary=bkk_summary)
+                    st.session_state['bkk_summary'] = bkk_summary
+                    st.session_state['bkk_product_err'] = bkk_product_err
                     st.session_state['bkk_result'] = bkk_result
                     st.session_state['bkk_filename'] = bkk_file.name
                 except Exception as e:
@@ -2274,6 +2597,62 @@ def _render_bkk():
             if bkk_notes:
                 st.markdown('<div class="rcm-card rcm-card-warn">⚠️ <b>ข้อสังเกต</b><br>' + '<br>'.join('• ' + n for n in bkk_notes) + '</div>',
                             unsafe_allow_html=True)
+
+            summ = st.session_state.get('bkk_summary')
+            if summ is not None:
+                st.write("")
+                st.markdown("##### 🧊 Dry Ice — สินค้า 4AOB / 4HFF")
+                if len(summ['dry_route']):
+                    tot = summ['dry_route'].iloc[-1]
+                    dc = st.columns(len(BKK_DRYICE_GROUPS) + 2)
+                    with dc[0]:
+                        stat_box("ออเดอร์ที่ต้องใช้ Dry Ice", f"{int(tot['จำนวนออเดอร์']):,}")
+                    for k, (prefix, _) in enumerate(BKK_DRYICE_GROUPS, start=1):
+                        with dc[k]:
+                            stat_box(f"{prefix} (Qty)", f"{tot[f'{prefix} (Qty)']:,.0f}")
+                    with dc[-1]:
+                        stat_box("รวม (Qty)", f"{tot['รวม (Qty)']:,.0f}", "Qty 1 = 1")
+                    st.dataframe(_bkk_show(summ['dry_route']), use_container_width=True, hide_index=True)
+                    with st.expander(f"ดูรายการ 4AOB / 4HFF ทั้งหมด ({len(summ['dry_lines']):,} รายการ)"):
+                        st.dataframe(_bkk_show(summ['dry_lines']), use_container_width=True, hide_index=True)
+                else:
+                    st.markdown('<div class="rcm-card">ไม่มีสินค้า 4AOB / 4HFF ในไฟล์นี้</div>', unsafe_allow_html=True)
+
+                st.write("")
+                st.markdown("##### ⚖️ น้ำหนัก (รวมจากทุกรายการสินค้าใน Sheet1)")
+                if summ['has_weight']:
+                    wt = summ['weight_route'].iloc[-1]
+                    wc_ = st.columns(len(summ['weight_sheet']))
+                    for k, rec in enumerate(summ['weight_sheet'].itertuples(index=False)):
+                        with wc_[k]:
+                            stat_box(rec[0], f"{rec[2]:,.2f} kg", f"{rec[1]:,} ออเดอร์")
+                    if wt['คิดไม่ได้']:
+                        n_all, n_bad = int(wt['จำนวนรายการ']), int(wt['คิดไม่ได้'])
+                        st.markdown(
+                            f'<div class="rcm-card rcm-card-warn">⚠️ คิดน้ำหนักได้ {n_all - n_bad:,} / {n_all:,} รายการ — '
+                            f'อีก {n_bad:,} รายการไม่ได้นับเข้ายอด (ยอดจริงจะมากกว่านี้) ดูสาเหตุด้านล่าง'
+                            ' · ในไฟล์ ช่องน้ำหนักสีเหลือง = ออเดอร์ที่น้ำหนักยังไม่ครบ</div>',
+                            unsafe_allow_html=True)
+                    st.dataframe(_bkk_show(summ['weight_route']), use_container_width=True, hide_index=True)
+                    if len(summ['bad_lines']):
+                        with st.expander(f"รายการที่คิดน้ำหนักไม่ได้ ({len(summ['bad_lines']):,}) — ส่วนใหญ่ต้องไปเพิ่ม/แก้ใน Product Master"):
+                            st.dataframe(_bkk_show(summ['bad_lines']), use_container_width=True, hide_index=True)
+                    if len(summ.get('missing_codes', [])):
+                        mc = summ['missing_codes']
+                        st.download_button(
+                            f"📋 ดาวน์โหลด Product Code ที่ไม่เจอใน Product Master ({len(mc):,} รหัส)",
+                            data=bkk_missing_codes_to_excel_bytes(mc),
+                            file_name=f"product_code_not_found_{bkk_file.name.rsplit('.', 1)[0]}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="bkk_missing_codes_btn",
+                            help="รหัสสินค้าใน Sheet1 ที่ไม่มีใน Product Master — เอาไปเพิ่มใน Google Sheets แล้วกดทำใบงานใหม่ น้ำหนักจะครบขึ้น",
+                        )
+                else:
+                    st.markdown(
+                        f'<div class="rcm-card rcm-card-warn">⚠️ ไม่ได้คิดน้ำหนัก — โหลด Product Master ไม่ได้ '
+                        f'({st.session_state.get("bkk_product_err") or "-"}) · ใบงานยังทำได้ตามปกติ แค่ช่องน้ำหนักว่าง</div>',
+                        unsafe_allow_html=True)
 
             st.write("")
             st.download_button(
