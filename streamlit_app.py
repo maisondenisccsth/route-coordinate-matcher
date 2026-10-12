@@ -1841,10 +1841,17 @@ def _render_qr():
 # ============================================================
 # TAB 4: FOR BKK — Sheet1 -> ใบงานต่อออเดอร์ (แยก Retail และ InterExp/B&W ออกเป็นชีทของตัวเอง)
 # ============================================================
+BKK_SERVICE_COL = 'Service Time (นาที)'
+# ท้ายใบงาน (ลอกข้อความจากใบงาน Sheet2 ของทีม)
+BKK_FOOTER_SIGN = ('ลงชื่อ_______________________________พนักงานขับ', 'รถเวลา________________________ออก')
+BKK_FOOTER_NOTES = [
+    'ถึงพนักงานขับรถ ถ้าในรูทมี สินค้า 4AOB ทุกตัว ให้เอากล่องสินค้าแพ็คลงกล่องโฟม และใส่ดรายไอซ์กล่องละ 2 ก้อน ก่อนนำสินค้าไปส่งลูกค้า เพราะขนมเสียหายง่ายต้อง ***',
+    'ถึงพนักงานขับรถ ถ้าในรูทมี สินค้า 4HFF ทุกตัว ให้เอากล่องสินค้าแพ็คลงกล่องโฟม และใส่ดรายไอซ์กล่องละ 2 ก้อน ก่อนนำสินค้าไปส่งลูกค้า เพราะสินค้าเสียหายง่ายต้อง ***',
+]
 BKK_COLUMNS = ['Order Date', 'OrderNo', 'Customers Code', 'Cust Type', 'Customer Name', 'ShipTo Name',
-               'ShipTo.Address', 'Route', 'Remark', 'เวลาเข้า', 'เวลาออก', 'Latitude', 'Longitude']
+               'ShipTo.Address', 'Route', 'Remark', 'เวลาเข้า', 'เวลาออก', BKK_SERVICE_COL, 'Latitude', 'Longitude']
 # ความกว้างคอลัมน์ลอกจากใบงาน Sheet2 ที่ทีมใช้อยู่จริง (A..K) + Lat/Lon
-BKK_COL_WIDTHS = [9.9, 39.1, 14.4, 9.1, 53.3, 53.7, 40.1, 19.4, 27.4, 7.7, 8.6, 12.5, 12.5]
+BKK_COL_WIDTHS = [9.9, 39.1, 14.4, 9.1, 53.3, 53.7, 40.1, 19.4, 27.4, 7.7, 8.6, 15.5, 12.5, 12.5]
 
 
 def build_channel_map(df):
@@ -1982,7 +1989,7 @@ def _bkk_is_carrier_route(route):
     return key.startswith('INTEREXP') or key in ('IEBW', 'BW', 'IE')
 
 
-def process_bkk_orders(orders, info, master_df, channel_map, dates=None):
+def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service_minutes=15, retail_service_minutes=45):
     """แยก Retail / ไม่ใช่ Retail + เติม Lat/Lon (จับด้วย ShipTo Name แบบเดียวกับแท็บประมวลผลไฟล์)
     Retail ดูจาก Channel ใน Master (คอลัมน์ C) ตาม ShipTo Name; ถ้าไม่เจอชื่อใน Master เลย
     ใช้ Cust Type ในไฟล์แทน (R = Retail) แล้วนับไว้รายงาน
@@ -2028,6 +2035,7 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None):
     df['Remark'] = None
     df['เวลาเข้า'] = None
     df['เวลาออก'] = None
+    df[BKK_SERVICE_COL] = None
     df['Latitude'] = lats
     df['Longitude'] = lons
     df['_retail'] = is_retail
@@ -2039,6 +2047,16 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None):
     df['_carrier'] = df['Route'].map(_bkk_is_carrier_route)
     df['_notype'] = df['Cust Type'].map(_cell_blank) & ~df['_carrier']
     rest = ~df['_carrier'] & ~df['_notype']
+    # Service Time: เวลามาตรฐานต่อร้าน (Retail 45 นาที / อื่นๆ 15 นาที) หารด้วยจำนวน SO ที่
+    # ShipTo Name เดียวกันในชีทเดียวกัน เช่น 3 SO ไปร้านเดียวกัน 15 นาที -> SO ละ 5 นาที
+    if len(df):
+        bucket = df['_carrier'].map({True: 'C', False: ''}) + df['_notype'].map({True: 'N', False: ''}) \
+            + (rest & df['_retail']).map({True: 'R', False: ''})
+        ship = df['ShipTo Name'].map(lambda v: normalize(v) or None)
+        ship = ship.fillna(pd.Series([f'__row{i}' for i in range(len(df))], index=df.index))
+        key = bucket + '|' + ship
+        standard = df['_retail'].map({True: float(retail_service_minutes), False: float(service_minutes)})
+        df[BKK_SERVICE_COL] = (standard / key.map(key.value_counts())).round(2)
     normal = df[rest & ~df['_retail']][BKK_COLUMNS].reset_index(drop=True)
     retail = df[rest & df['_retail']][BKK_COLUMNS].reset_index(drop=True)
     carrier = df[df['_carrier']][BKK_COLUMNS].reset_index(drop=True)
@@ -2050,7 +2068,7 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None):
         'notype': len(notype), 'coords_notype': int(notype['Latitude'].notna().sum()),
         'carrier_notype': int((df['_carrier'] & df['Cust Type'].map(_cell_blank)).sum()),
         'carrier_retail': int((df['_carrier'] & df['_retail']).sum()),
-        'retail_by_cust_type': by_cust_type, 'forced_fs': forced_fs,
+        'retail_by_cust_type': by_cust_type, 'forced_fs': forced_fs, 'service_minutes': service_minutes, 'retail_service_minutes': retail_service_minutes,
         'coords_normal': int(normal['Latitude'].notna().sum()), 'coords_retail': int(retail['Latitude'].notna().sum()),
         'coords_carrier': int(carrier['Latitude'].notna().sum()),
     })
@@ -2101,9 +2119,17 @@ def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None):
                 cell.alignment = Alignment(horizontal='center' if name in center_cols else 'left', vertical='center')
             ws.row_dimensions[i].height = 21.75
 
+        # ท้ายใบงาน: เว้น 2 แถว แล้วช่องลงชื่อคนขับ + หมายเหตุถึงคนขับ
+        foot = 5 + len(df) + 2
+        ws.cell(row=foot, column=2, value=BKK_FOOTER_SIGN[0]).font = f_body
+        ws.cell(row=foot, column=6, value=BKK_FOOTER_SIGN[1]).font = f_body
+        ws.row_dimensions[foot].height = 21
+        for k, note in enumerate(BKK_FOOTER_NOTES, start=1):
+            ws.cell(row=foot + k, column=2, value=note).font = f_body
+            ws.row_dimensions[foot + k].height = 21
+
         for c, w in enumerate(BKK_COL_WIDTHS, start=1):
             ws.column_dimensions[get_column_letter(c)].width = w
-        ws.freeze_panes = 'A5'
         ws.print_title_rows = '1:4'
         ws.page_setup.orientation = 'landscape'
         ws.page_setup.fitToWidth = 1
@@ -2154,6 +2180,12 @@ def _render_bkk():
             st.warning("⚠️ กรุณาเลือก Order Date อย่างน้อย 1 วัน")
             return
 
+        st.caption("⏱️ เวลาบริการมาตรฐานต่อร้าน (นาที) — หารเท่า ๆ กันตามจำนวน SO ที่ ShipTo Name เดียวกัน")
+        svc_c1, svc_c2 = st.columns(2)
+        with svc_c1:
+            bkk_service = st.number_input("Food Service", min_value=1.0, max_value=240.0, value=15.0, step=1.0, key="bkk_service_min")
+        with svc_c2:
+            bkk_service_retail = st.number_input("Retail", min_value=1.0, max_value=240.0, value=45.0, step=1.0, key="bkk_service_min_retail")
         bkk_clicked = st.button("🚀 ทำใบงาน For BKK", type="primary", use_container_width=True, key="bkk_btn")
 
         if bkk_clicked:
@@ -2164,6 +2196,8 @@ def _render_bkk():
                     bkk_normal, bkk_retail, bkk_carrier, bkk_notype, bkk_result = process_bkk_orders(
                         bkk_orders, bkk_info, master_df, bkk_channels,
                         dates=bkk_sel_dates if len(bkk_dates) > 1 else None,
+                        service_minutes=float(bkk_service),
+                        retail_service_minutes=float(bkk_service_retail),
                     )
                     st.session_state['bkk_xlsx'] = bkk_to_excel_bytes(bkk_normal, bkk_retail, bkk_carrier, bkk_notype)
                     st.session_state['bkk_result'] = bkk_result
