@@ -2075,7 +2075,17 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service
     return normal, retail, carrier, notype, out_info
 
 
-def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None):
+def bkk_sheet1_clean(file_bytes):
+    """Sheet1 ต้นฉบับ (ทุกวันที่ ไม่กรองอะไร) ตัดเฉพาะแถวที่ว่างทั้งแถว และคอลัมน์คั่นที่ว่างทั้งคอลัมน์
+    ค่าในทุกช่องที่มีข้อมูลคงเดิม"""
+    xl = pd.ExcelFile(io.BytesIO(file_bytes))
+    sheet = 'Sheet1' if 'Sheet1' in xl.sheet_names else xl.sheet_names[0]
+    raw = xl.parse(sheet, header=None)
+    blank = raw.apply(lambda col: col.map(_cell_blank))
+    return raw.loc[~blank.all(axis=1), ~blank.all(axis=0)].reset_index(drop=True)
+
+
+def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_df=None):
     """ชีท Order / Retail / InterExp-B&W (+ No Cust Type ถ้ามีออเดอร์ที่ช่อง Cust Type ว่าง)
     หน้าตาเดียวกับใบงาน Sheet2: หัวกระดาษ ทะเบียนรถ/วันที่/เลขไมล์,
     หัวตารางแถว 4, ฟอนต์ Cordia New, เส้นขอบทุกช่อง + Lat/Lon ต่อท้าย"""
@@ -2087,6 +2097,21 @@ def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None):
     f_head = Font(name='Cordia New', size=14, bold=True, underline='single')
     f_body = Font(name='Cordia New', size=14)
     center_cols = {'Cust Type', 'Route'}
+
+    # Sheet1 ต้นฉบับ (ตัดแถว/คอลัมน์ว่างแล้ว) เก็บไว้เป็นชีทแรก
+    if sheet1_df is not None and len(sheet1_df):
+        ws1 = wb.create_sheet(title='Sheet1')
+        f_s1 = Font(name='Cordia New', size=14)
+        f_s1_head = Font(name='Cordia New', size=14, bold=True)
+        for r_i, row in enumerate(sheet1_df.itertuples(index=False), start=1):
+            for c_i, v in enumerate(row, start=1):
+                if _cell_blank(v):
+                    continue
+                cell = ws1.cell(row=r_i, column=c_i, value=v)
+                cell.font = f_s1_head if r_i == 1 else f_s1
+        for c_i, col in enumerate(sheet1_df.columns, start=1):
+            width = max((len(str(v)) for v in sheet1_df[col] if not _cell_blank(v)), default=6)
+            ws1.column_dimensions[get_column_letter(c_i)].width = min(max(width + 2, 8), 50)
 
     sheets = [('Order', normal_df), ('Retail', retail_df), (BKK_CARRIER_SHEET, carrier_df)]
     if notype_df is not None and len(notype_df):
@@ -2195,7 +2220,8 @@ def _render_bkk():
                         service_minutes=float(bkk_service),
                         retail_service_minutes=float(bkk_service_retail),
                     )
-                    st.session_state['bkk_xlsx'] = bkk_to_excel_bytes(bkk_normal, bkk_retail, bkk_carrier, bkk_notype)
+                    st.session_state['bkk_xlsx'] = bkk_to_excel_bytes(bkk_normal, bkk_retail, bkk_carrier, bkk_notype,
+                                                                      sheet1_df=bkk_sheet1_clean(bkk_bytes))
                     st.session_state['bkk_result'] = bkk_result
                     st.session_state['bkk_filename'] = bkk_file.name
                 except Exception as e:
@@ -2244,7 +2270,7 @@ def _render_bkk():
 
             st.write("")
             st.download_button(
-                "⬇️ ดาวน์โหลดใบงาน For BKK (Excel: Order + Retail + InterExp-B&W + No Cust Type)",
+                "⬇️ ดาวน์โหลดใบงาน For BKK (Excel: Sheet1 + Order + Retail + InterExp-B&W + No Cust Type)",
                 data=st.session_state['bkk_xlsx'],
                 file_name=f"{bkk_file.name.rsplit('.', 1)[0]}_For_BKK.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
