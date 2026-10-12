@@ -538,6 +538,7 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
         use_code_fallback_for_sheet = (ship_col is None and name_fallback_col is None)
 
         out_rows = []
+        extra_rows = set()  # index ใน out_rows ของแถวที่ไม่ใช่ออเดอร์ (เก็บไว้แต่ไม่เอาไปไฟล์จุดส่งไม่ซ้ำ)
         matched = total = via_ship = via_code = 0
 
         for r, row in enumerate(raw):
@@ -551,6 +552,12 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
 
             cust_val = row[cust_col] if cust_col < len(row) else None
             if cust_val is None or (isinstance(cust_val, float) and pd.isna(cust_val)) or str(cust_val).strip() == '':
+                # ไม่มีรหัสลูกค้า: ถ้าแถวมีข้อความ (เช่น ท้ายใบงาน "ลงชื่อ...พนักงานขับ", หมายเหตุถึงคนขับ,
+                # งาน "ตามใบคุม") -> เก็บไว้ตามเดิม ไม่มีพิกัด และไม่นับเป็นออเดอร์
+                # ตัดทิ้งเฉพาะแถวว่าง หรือแถวที่มีแค่ช่องแรก (เช่นเลขลำดับเปล่าๆ ในเทมเพลตสมุย)
+                if any(not _cell_blank(v) for v in row[1:]):
+                    out_rows.append(list(row) + [None, None])
+                    extra_rows.add(len(out_rows) - 1)
                 continue
 
             code = str(cust_val).strip()
@@ -618,7 +625,7 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
         # ใช้ template เดียวกับ out_rows เป๊ะ (คอลัมน์เดิมทั้งหมด + Latitude/Longitude)
         # แค่ยุบแถวที่พิกัด (2 คอลัมน์สุดท้าย) ซ้ำกันให้เหลือแถวแรกที่เจอ แล้วเติมคอลัมน์นับจำนวนออเดอร์ต่อท้าย
         preamble_and_header = out_rows[:header_row + 1]
-        data_rows = out_rows[header_row + 1:]
+        data_rows = [r_ for k_, r_ in enumerate(out_rows) if k_ > header_row and k_ not in extra_rows]
 
         seen_order = []
         seen_row = {}
