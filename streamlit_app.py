@@ -2146,10 +2146,6 @@ def _render_bkk():
         st.error("⚠️ ยังไม่ได้ตั้งค่า MASTER_SHEET_CSV_URL — ดูวิธีตั้งค่าใน DEPLOY_INSTRUCTIONS.md")
         return
     st.markdown("##### 🏙️ For BKK — ทำใบงานจาก Sheet1")
-    st.caption("อัพโหลดไฟล์ route (ใช้เฉพาะ Sheet1) ระบบจะตัดแถวว่าง ยุบให้เหลือ 1 แถวต่อ 1 OrderNo "
-               "แยก Route InterExp / IE,B&W ไปชีทหนึ่ง แยก Retail ไปอีกชีท (ดู Channel ใน Master จาก ShipTo Name) "
-               "แล้วเติม Lat/Lon ให้ ได้ไฟล์เดียว: Order, Retail, InterExp-B&W หน้าตาเหมือนใบงาน Sheet2 "
-               "(ออเดอร์ที่ช่อง Cust Type ว่างจะถูกเก็บไว้ในชีท No Cust Type ไม่ลบทิ้ง)")
 
     bkk_file = st.file_uploader("อัพโหลดไฟล์ route", type=['xls', 'xlsx'], label_visibility="collapsed", key="bkk_uploader")
 
