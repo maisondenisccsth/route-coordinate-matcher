@@ -1993,6 +1993,17 @@ def _bkk_route_sort_key(route):
 
 
 BKK_CARRIER_SHEET = 'InterExp-B&W'
+# ใบงาน: Retail กับ InterExp-B&W อยู่ชีทเดียวกัน (Retail ก่อน แล้วต่อด้วย InterExp-B&W) — Service Time ยังคิดแยกกลุ่มเหมือนเดิม
+BKK_RETAIL_CARRIER_SHEET = 'Retail + InterExp-B&W'
+
+
+def bkk_output_sheets(normal_df, retail_df, carrier_df, notype_df=None):
+    """ชีทที่อยู่ในไฟล์ใบงาน: Order / Retail + InterExp-B&W / (No Cust Type ถ้ามี)"""
+    sheets = [('Order', normal_df),
+              (BKK_RETAIL_CARRIER_SHEET, pd.concat([retail_df, carrier_df], ignore_index=True))]
+    if notype_df is not None and len(notype_df):
+        sheets.append((BKK_NOTYPE_SHEET, notype_df))
+    return sheets
 BKK_NOTYPE_SHEET = 'No Cust Type'
 
 # ลูกค้าที่ในระบบเป็น R (Retail) แต่ให้ถือเป็น F (Food Service) เสมอ — เพิ่มชื่อในลิสต์นี้ได้
@@ -2377,7 +2388,7 @@ def _bkk_write_summary_sheets(wb, summary):
 
 
 def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_df=None, summary=None):
-    """ชีท Order / Retail / InterExp-B&W (+ No Cust Type ถ้ามีออเดอร์ที่ช่อง Cust Type ว่าง)
+    """ชีท Order / Retail + InterExp-B&W (+ No Cust Type ถ้ามีออเดอร์ที่ช่อง Cust Type ว่าง)
     หน้าตาเดียวกับใบงาน Sheet2: หัวกระดาษ ทะเบียนรถ/วันที่/เลขไมล์,
     หัวตารางแถว 4, ฟอนต์ Cordia New, เส้นขอบทุกช่อง + Lat/Lon ต่อท้าย"""
     wb = Workbook()
@@ -2410,9 +2421,7 @@ def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_
             width = max((len(str(v)) for v in sheet1_df[col] if not _cell_blank(v)), default=6)
             ws1.column_dimensions[get_column_letter(c_i)].width = min(max(width + 2, 8), 50)
 
-    sheets = [('Order', normal_df), ('Retail', retail_df), (BKK_CARRIER_SHEET, carrier_df)]
-    if notype_df is not None and len(notype_df):
-        sheets.append((BKK_NOTYPE_SHEET, notype_df))
+    sheets = bkk_output_sheets(normal_df, retail_df, carrier_df, notype_df)
     for title, df in sheets:
         ws = wb.create_sheet(title=title)
         ws['B1'] = 'ทะเบียนรถ____________________'
@@ -2544,8 +2553,7 @@ def _render_bkk():
                         retail_service_minutes=float(bkk_service_retail),
                         product_df=bkk_product,
                     )
-                    bkk_sheets = [('Order', bkk_normal), ('Retail', bkk_retail), (BKK_CARRIER_SHEET, bkk_carrier),
-                                  (BKK_NOTYPE_SHEET, bkk_notype)]
+                    bkk_sheets = bkk_output_sheets(bkk_normal, bkk_retail, bkk_carrier, bkk_notype)
                     bkk_summary = bkk_summaries(bkk_sheets, bkk_result['weighed_lines'])
                     st.session_state['bkk_xlsx'] = bkk_to_excel_bytes(bkk_normal, bkk_retail, bkk_carrier, bkk_notype,
                                                                       sheet1_df=bkk_sheet1_clean(bkk_bytes),
@@ -2566,16 +2574,15 @@ def _render_bkk():
             </div>
             """, unsafe_allow_html=True)
 
-            bc1, bc2, bc3, bc4 = st.columns(4)
+            bc1, bc2, bc4 = st.columns(3)
+            rc_total = res['retail'] + res['carrier']
             with bc1:
                 stat_box("SHEET: Order", f"{res['normal']:,}",
                           f"มีพิกัด {res['coords_normal']:,} / {res['normal']:,}")
             with bc2:
-                stat_box("SHEET: Retail", f"{res['retail']:,}",
-                          f"มีพิกัด {res['coords_retail']:,} / {res['retail']:,}")
-            with bc3:
-                stat_box("SHEET: InterExp-B&W", f"{res['carrier']:,}",
-                          f"มีพิกัด {res['coords_carrier']:,} / {res['carrier']:,} · เป็น Retail {res['carrier_retail']:,}")
+                stat_box(f"SHEET: {BKK_RETAIL_CARRIER_SHEET}", f"{rc_total:,}",
+                          f"Retail {res['retail']:,} · InterExp-B&W {res['carrier']:,} · "
+                          f"มีพิกัด {res['coords_retail'] + res['coords_carrier']:,} / {rc_total:,}")
             with bc4:
                 stat_box("SHEET: No Cust Type", f"{res['notype']:,}",
                           f"มีพิกัด {res['coords_notype']:,} / {res['notype']:,}" if res['notype'] else "ไม่มี — ไม่สร้างชีทนี้")
@@ -2586,7 +2593,7 @@ def _render_bkk():
             if res['notype']:
                 bkk_notes.append(f"{res['notype']:,} ออเดอร์ช่อง Cust Type ว่าง — แยกไว้ในชีท {BKK_NOTYPE_SHEET} ให้ตรวจเอง (ไม่ได้ลบ และไม่ได้เดาประเภท)")
             if res.get('carrier_notype'):
-                bkk_notes.append(f"{res['carrier_notype']:,} ออเดอร์ในชีท {BKK_CARRIER_SHEET} ช่อง Cust Type ว่าง (อยู่ชีทนั้นตาม Route)")
+                bkk_notes.append(f"{res['carrier_notype']:,} ออเดอร์ InterExp-B&W (ชีท {BKK_RETAIL_CARRIER_SHEET}) ช่อง Cust Type ว่าง (อยู่ชีทนั้นตาม Route)")
             if res.get('forced_fs'):
                 bkk_notes.append(f"{res['forced_fs']:,} ออเดอร์ของ {', '.join(BKK_FORCE_FOOD_SERVICE)} ถูกเปลี่ยนเป็น F (Food Service) ตามที่ตั้งไว้")
             if res['multi_route']:
