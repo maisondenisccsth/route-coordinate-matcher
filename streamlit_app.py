@@ -398,10 +398,37 @@ def load_master_data(url):
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"ไม่พบคอลัมน์: {', '.join(missing)} กรุณาตรวจสอบหัวตารางใน Google Sheets")
-    df = df.dropna(subset=['Ship To', 'Latitude', 'Longitude'])
+    return prepare_master(df)
+
+
+def prepare_master(df):
+    """Customer Master -> แถวที่ใช้จับคู่พิกัด
+    - ต้องมี Latitude + Longitude (ไม่มีพิกัดก็ใช้ไม่ได้)
+    - แถวที่ไม่มีรหัส Ship To ยังใช้จับคู่ด้วยชื่อได้ แต่เฉพาะชื่อที่ยังไม่มีแถวที่มีรหัส
+      (ถ้าชื่อนี้มีแถวที่มีรหัสอยู่แล้ว ใช้แถวที่มีรหัสเสมอ — แถวที่เพิ่มเองไม่ไปทับข้อมูลจากระบบ)"""
+    df = df.dropna(subset=['Latitude', 'Longitude']).copy()
+    df = df[df['Ship To Name'].notna() | df['Ship To'].notna()]
     df['norm_ship'] = df['Ship To Name'].apply(normalize)
-    df['norm_code'] = df['Ship To'].astype(str).str.strip().str.upper()
+    has_code = df['Ship To'].map(lambda v: not _cell_blank(v))
+    df['norm_code'] = [str(v).strip().upper() if h else None for v, h in zip(df['Ship To'], has_code)]
+    coded_names = set(df.loc[has_code, 'norm_ship'])
+    # กันแถวที่เพิ่มเองเป็น "ชื่อบริษัทแม่" (เช่น BAKEHOUSE CO.,LTD.) ที่บริษัทนั้นมีหลายสาขาคนละที่ในระบบ
+    # ถ้าใช้ จะได้พิกัดสำนักงานใหญ่ไปใส่ให้ทุกสาขา -> ไม่ใช้แถวแบบนี้
+    if 'Name' in df.columns:
+        coded = df[has_code].assign(_cn=df.loc[has_code, 'Name'].apply(normalize))
+        pins = coded.groupby('_cn')[['Latitude', 'Longitude']].nunique()
+        multi_branch_companies = set(pins[(pins['Latitude'] > 1) | (pins['Longitude'] > 1)].index)
+    else:
+        multi_branch_companies = set()
+    keep_nocode = ~has_code & ~df['norm_ship'].isin(coded_names) & ~df['norm_ship'].isin(multi_branch_companies)
+    df = df[has_code | keep_nocode]
     return df
+
+
+def master_multi_pin_names(master_df):
+    """ชื่อ (normalize แล้ว) ที่มีหลายแถวใน Master และพิกัดไม่ตรงกัน"""
+    grp = master_df.groupby('norm_ship')[['Latitude', 'Longitude']].nunique()
+    return set(grp[(grp['Latitude'] > 1) | (grp['Longitude'] > 1)].index)
 
 
 @st.cache_data(ttl=300)
@@ -466,7 +493,8 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
     ambiguous = []
 
     by_ship = master_df.drop_duplicates('norm_ship').set_index('norm_ship')
-    by_code = master_df.drop_duplicates('norm_code').set_index('norm_code')
+    by_code = master_df.dropna(subset=['norm_code']).drop_duplicates('norm_code').set_index('norm_code')
+    multi_pin_keys = master_multi_pin_names(master_df)
 
     ambiguous_ship_keys = set()
     if not dedupe_shipto:
@@ -536,6 +564,13 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
         #      เพราะลูกค้า 1 รายอาจมีหลายสาขา การเดาด้วยโค้ดระดับลูกค้าจะได้พิกัดสาขาอื่นมาแบบผิดๆ)
         #   - ถ้าชีทนี้ไม่มีทั้งสองคอลัมน์เลย -> ทั้งชีทจะจับคู่ด้วย Cust Code <-> Ship To (Master) แทน
         use_code_fallback_for_sheet = (ship_col is None and name_fallback_col is None)
+        # มีคอลัมน์ ShipTo Name แต่บางแถวว่าง (เช่นแถวที่ทีมเพิ่มเองใน Sheet2) -> แถวนั้นใช้ Customer Name แทน
+        row_name_col = None
+        if ship_col is not None:
+            for i, v in enumerate(header):
+                if isinstance(v, str) and ('cust' in v.lower() or 'customer' in v.lower()) and 'name' in v.lower():
+                    row_name_col = i
+                    break
 
         out_rows = []
         extra_rows = set()  # index ใน out_rows ของแถวที่ไม่ใช่ออเดอร์ (เก็บไว้แต่ไม่เอาไปไฟล์จุดส่งไม่ซ้ำ)
@@ -562,8 +597,14 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
 
             code = str(cust_val).strip()
             total += 1
-            if ship_col is not None and ship_col < len(row):
+            via_row_fallback = False
+            if ship_col is not None and ship_col < len(row) and not _cell_blank(row[ship_col]):
                 ship_val = row[ship_col]
+            elif ship_col is not None:
+                # ShipTo Name ว่างเฉพาะแถวนี้ -> ใช้ Customer Name (ถ้าชื่อนี้มีหลายหมุดใน Master จะไม่เดา)
+                ship_val = row[row_name_col] if (row_name_col is not None and row_name_col < len(row)
+                                                 and not _cell_blank(row[row_name_col])) else None
+                via_row_fallback = ship_val is not None
             elif name_fallback_col is not None and name_fallback_col < len(row):
                 ship_val = row[name_fallback_col]
             else:
@@ -575,7 +616,7 @@ def process_route_file(file_bytes, master_df, selected_sheets=None, dedupe_shipt
                 # โหมดจับคู่ด้วยชื่อ: ลองครั้งเดียว ไม่ fallback ไป Cust Code ต่อแถวต่อแถว
                 if ship_val:
                     key = normalize(ship_val)
-                    if key in ambiguous_ship_keys:
+                    if key in ambiguous_ship_keys or (via_row_fallback and key in multi_pin_keys):
                         # ชื่อนี้ซ้ำในหลายสาขาที่พิกัดขัดแย้งกัน (เช่น Big C หลายสาขาชื่อเดียวกัน)
                         # ไม่เดาว่าเป็นสาขาไหน -> ถือว่ายังไม่มีพิกัด แล้วบันทึกแยกไว้ให้ตรวจสอบ
                         is_ambiguous = True
@@ -2237,11 +2278,17 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service
 
     by_ship = master_df.drop_duplicates('norm_ship').set_index('norm_ship')
     name_col = 'ShipTo Name' if info.get('has_shipto_col', True) else 'Customer Name'
+    multi_pin_keys = master_multi_pin_names(master_df)
 
     forced_keys = {_bkk_name_key(n) for n in BKK_FORCE_FOOD_SERVICE}
     lats, lons, is_retail, cust_types, by_cust_type, forced_fs = [], [], [], [], 0, 0
     for _, r in df.iterrows():
         key = normalize(r[name_col])
+        no_coord_key = False
+        if not key and name_col == 'ShipTo Name':
+            # ShipTo Name ว่างเฉพาะออเดอร์นี้ -> ใช้ Customer Name (ถ้าชื่อนี้มีหลายหมุดใน Master จะไม่เดาพิกัด)
+            key = normalize(r['Customer Name'])
+            no_coord_key = key in multi_pin_keys
         ch = channel_map.get(key) if key else None
         if _bkk_name_key(r['ShipTo Name']) in forced_keys or _bkk_name_key(r['Customer Name']) in forced_keys:
             # ข้อยกเว้นที่กำหนดไว้: ถือเป็น Food Service เสมอ และเปลี่ยน Cust Type เป็น F
@@ -2255,7 +2302,7 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service
             by_cust_type += 1
             is_retail.append(str(r['Cust Type']).strip().upper() == 'R')
             cust_types.append(r['Cust Type'])
-        if key and key in by_ship.index:
+        if key and not no_coord_key and key in by_ship.index:
             hit = by_ship.loc[key]
             lats.append(hit['Latitude'])
             lons.append(hit['Longitude'])
