@@ -2720,15 +2720,405 @@ def _render_bkk():
 
 
 # ============================================================
+# TAB: FOR PKT — ไฟล์ดิบภูเก็ต (รายการ Invoice) -> ใบงาน 1 แถวต่อ 1 SO + Lat/Lon + Service Time
+#   ไม่มี Dry Ice / น้ำหนัก / ท้ายใบงาน
+# ============================================================
+PKT_SERVICE_COL = 'Service Time (นาที)'
+PKT_COLUMNS = ['Order Date', 'OrderNo', 'Invoice', 'Customers Code', 'Cust Type', 'Customer Name', 'ShipTo Name',
+               'Warehouse', 'Sales Person', 'Route', 'Remark', 'เวลาเข้า', 'เวลาออก', PKT_SERVICE_COL,
+               'Latitude', 'Longitude']
+PKT_COL_WIDTHS = [11, 11, 18, 13, 9, 45, 45, 11, 15, 12, 22, 8, 8, 15, 12.5, 12.5]
+PKT_NO_SO_SHEET = 'ไม่มี SO'
+PKT_JOB_SHEET = 'Order'
+# ชีทใบงานตามเทมเพลตที่ทีมภูเก็ตใช้ (Route เว้นว่างไว้ให้กรอกเอง)
+PKT_JOB_COLUMNS = ['Inv Date', 'Order', 'Cust. Name', 'Ship To', 'Term', 'Sales Person', 'Legal Number',
+                   'Total Amount ', 'Route', 'อุณหภูมิก่อนโหลด', 'อุณหภูมิเวลาเข้าส่ง', 'อุณหภูมิเวลาออกส่ง',
+                   PKT_SERVICE_COL, 'Latitude', 'Longitude']
+PKT_JOB_WIDTHS = [12, 10, 42.6, 42.7, 24.9, 13, 16, 13, 11, 15.4, 15.5, 16, 15, 12.5, 12.5]
+PKT_JOB_TOP = ('ทะเบียนรถ___________________', 'เลขไมล์ ออกจากคลัง________________________')
+PKT_JOB_FOOTER = 'รายชื่อ พขร.'
+PKT_FS_GROUPS = {'FS', 'ACCO', 'MINO', 'HYAT'}   # คอลัมน์ Group ในไฟล์ดิบ: FS / ACCO(R) / Mino(r) / Hyatt -> Food Service
+
+
+def _pkt_type_from_channel(ch):
+    """Channel ใน Customer Master -> F / R / None"""
+    if ch is None:
+        return None
+    c = str(ch).strip().lower()
+    if c == 'retail':
+        return 'R'
+    if c == 'food service' or c.startswith('fs'):
+        return 'F'
+    return None
+
+
+def _pkt_type_from_group(g):
+    """คอลัมน์ Group ในไฟล์ดิบ -> F / R / None (ใช้เมื่อหา Channel ใน Master ไม่เจอ)"""
+    if _cell_blank(g):
+        return None
+    k = str(g).strip().upper()
+    if k in PKT_FS_GROUPS or k.startswith('FS'):
+        return 'F'
+    if k in ('RT', 'R', 'RETAIL') or k.startswith('RT'):
+        return 'R'
+    return None
+
+
+def read_pkt_orders(file_bytes):
+    """อ่านไฟล์ดิบภูเก็ต (1 แถว = 1 Invoice) -> 1 แถวต่อ 1 SO (คอลัมน์ Order)
+    - ตัดแถวว่างทั้งแถว
+    - SO เดียวกันหลาย Invoice -> รวมเป็นแถวเดียว (เก็บเลข Invoice ไว้ทุกใบ)
+    - Invoice ที่ไม่มี SO (Order ว่างหรือ 0) -> ไม่ทิ้ง แยกไว้ต่างหาก 1 แถวต่อ 1 Invoice
+    Returns (orders_df, no_so_df, info)"""
+    xl = pd.ExcelFile(io.BytesIO(file_bytes))
+    sheet = 'Sheet1' if 'Sheet1' in xl.sheet_names else xl.sheet_names[0]
+    raw = xl.parse(sheet, header=None).values.tolist()
+    header_row, c_order = find_header_row(raw, ['order', 'orderno', 'order no', 'order no.', 'so', 'so no', 'so no.'])
+    if header_row is None:
+        raise ValueError(f'ไม่พบคอลัมน์ Order (เลข SO) ในชีท "{sheet}"')
+    header = [v.strip().lower() if isinstance(v, str) else '' for v in raw[header_row]]
+
+    def col(*names):
+        for i, h in enumerate(header):
+            if h in names:
+                return i
+        return None
+
+    c_date = col('inv date', 'order date', 'invoice date', 'date')
+    c_inv = col('invoice', 'invoice no', 'invoice no.')
+    c_code = col('cust. id', 'cust id', 'cust.id', 'cust code', 'customer code', 'customers code')
+    c_cname = col('cust. name', 'cust name', 'cust.name', 'customer name')
+    c_ship = col('ship to', 'shipto name', 'ship to name', 'shipto')
+    c_group = col('group')
+    c_wh = col('warehouse')
+    c_sales = col('sales person', 'salesperson')
+    c_term = col('term')
+    c_legal = col('legal number', 'legal no', 'legal no.')
+    c_amt = col('total amount', 'total')
+
+    def get(row, c):
+        if c is None or c >= len(row) or _cell_blank(row[c]):
+            return None
+        v = row[c]
+        return v.strip() if isinstance(v, str) else v
+
+    def fmt_date(v):
+        if isinstance(v, (pd.Timestamp, datetime)):
+            return v.strftime('%Y/%m/%d')
+        return None if v is None else str(v)
+
+    orders, seen, no_so = [], {}, []
+    lines = 0
+    for row in raw[header_row + 1:]:
+        if all(_cell_blank(v) for v in row):
+            continue
+        lines += 1
+        so = _bkk_clean_key(get(row, c_order))
+        inv = _bkk_clean_key(get(row, c_inv))
+        rec = {
+            'Order Date': fmt_date(get(row, c_date)), 'OrderNo': so, 'Invoice': None if inv is None else str(inv),
+            'Customers Code': get(row, c_code), 'Group': get(row, c_group), 'Customer Name': get(row, c_cname),
+            'ShipTo Name': get(row, c_ship), 'Warehouse': get(row, c_wh), 'Sales Person': get(row, c_sales),
+            'Term': get(row, c_term), 'Legal Number': get(row, c_legal),
+            'Total Amount': get(row, c_amt), '_date': get(row, c_date),
+        }
+        if so in (None, 0, '0', ''):
+            rec['OrderNo'] = None
+            no_so.append(rec)
+            continue
+        if so in seen:
+            first = seen[so]
+            if rec['Invoice'] and rec['Invoice'] not in (first['Invoice'] or '').split(', '):
+                first['Invoice'] = rec['Invoice'] if not first['Invoice'] else first['Invoice'] + ', ' + rec['Invoice']
+                # SO เดียวหลาย Invoice: รวมยอดเงิน และเก็บ Legal Number ทุกใบ
+                if isinstance(rec['Total Amount'], (int, float)):
+                    first['Total Amount'] = (first['Total Amount'] or 0) + rec['Total Amount']
+                if rec['Legal Number'] and first['Legal Number'] and rec['Legal Number'] not in first['Legal Number']:
+                    first['Legal Number'] = f"{first['Legal Number']}, {rec['Legal Number']}"
+            for k, v in rec.items():
+                if first.get(k) is None and v is not None:
+                    first[k] = v
+            continue
+        seen[so] = rec
+        orders.append(rec)
+
+    cols = ['Order Date', 'OrderNo', 'Invoice', 'Customers Code', 'Group', 'Customer Name', 'ShipTo Name',
+            'Warehouse', 'Sales Person', 'Term', 'Legal Number', 'Total Amount', '_date']
+    info = {'sheet': sheet, 'lines': lines, 'orders': len(orders), 'no_so': len(no_so),
+            'multi_invoice': sum(1 for r in orders if r['Invoice'] and ', ' in r['Invoice'])}
+    return pd.DataFrame(orders, columns=cols), pd.DataFrame(no_so, columns=cols), info
+
+
+def process_pkt_orders(orders, no_so, master_df, channel_map, dates=None, fs_minutes=20, retail_minutes=45):
+    """เติม Cust Type (Channel ใน Master ก่อน ไม่เจอค่อยดูคอลัมน์ Group), Lat/Lon และ Service Time
+    Service Time: F = fs_minutes, R = retail_minutes หารตามจำนวน SO ที่ ShipTo Name เดียวกัน (ประเภทอื่นเว้นว่าง)
+    ShipTo Name ว่าง -> ใช้ Customer Name แทน (ถ้าชื่อนั้นมีหลายหมุดใน Master จะไม่เดาพิกัด)
+    Returns (orders_df, no_so_df, info)"""
+    by_ship = master_df.drop_duplicates('norm_ship').set_index('norm_ship')
+    multi_pin_keys = master_multi_pin_names(master_df)
+
+    def fill(df):
+        df = df.copy()
+        if dates is not None:
+            keep = set(str(d) for d in dates)
+            df = df[df['Order Date'].astype(str).isin(keep)]
+        lats, lons, types, keys, by_group = [], [], [], [], 0
+        for _, r in df.iterrows():
+            key = normalize(r['ShipTo Name'])
+            no_coord = False
+            if not key:
+                key = normalize(r['Customer Name'])
+                no_coord = key in multi_pin_keys
+            keys.append(key or None)
+            t = _pkt_type_from_channel(channel_map.get(key)) if key else None
+            if t is None:
+                t = _pkt_type_from_group(r['Group'])
+                if t is not None:
+                    by_group += 1
+            types.append(t)
+            if key and not no_coord and key in by_ship.index:
+                hit = by_ship.loc[key]
+                lats.append(hit['Latitude'])
+                lons.append(hit['Longitude'])
+            else:
+                lats.append(None)
+                lons.append(None)
+        df['Cust Type'] = types
+        df['Latitude'] = lats
+        df['Longitude'] = lons
+        df['_key'] = keys
+        for c in ('Route', 'Remark', 'เวลาเข้า', 'เวลาออก'):
+            df[c] = None
+        return df, by_group
+
+    # Invoice ที่ไม่มี SO (Order = 0) อยู่ชีทเดียวกับ SO อื่น ใส่ Order เป็น 0 ตามไฟล์ดิบ (1 แถวต่อ 1 Invoice)
+    no_so = no_so.copy()
+    no_so['OrderNo'] = 0
+    o, g1 = fill(pd.concat([orders, no_so], ignore_index=True))
+    n, g2 = fill(no_so.iloc[0:0])
+
+    # เรียงตามวันที่ -> Warehouse -> ชื่อร้าน (ร้านเดียวกันในวันเดียวกันอยู่ติดกัน)
+    o = o.assign(_dk=o['Order Date'].map(lambda v: '' if v is None else str(v)),
+                 _wk=o['Warehouse'].map(lambda v: '~' if _cell_blank(v) else str(v)),
+                 _sk=o['_key'].map(lambda v: v or '')).sort_values(['_dk', '_wk', '_sk'], kind='stable')
+
+    # Service Time: เวลามาตรฐานตามประเภท หารด้วยจำนวน SO ของ ShipTo เดียวกัน "ในวันเดียวกัน"
+    # (ไฟล์ภูเก็ตมีหลายวันในไฟล์เดียว ร้านเดียวกันคนละวัน = คนละรอบส่ง) นับรวมแถวที่ไม่มี SO ด้วย
+    std = {'F': float(fs_minutes), 'R': float(retail_minutes)}
+    both = pd.concat([o[['Order Date', '_key']], n[['Order Date', '_key']]], ignore_index=True)
+    counts = both.dropna(subset=['_key']).groupby(['Order Date', '_key'], dropna=False).size().to_dict()
+
+    def svc(df):
+        out = []
+        for d, k, t in zip(df['Order Date'], df['_key'], df['Cust Type']):
+            if t not in std:
+                out.append(None)
+            elif not k:
+                out.append(std[t])
+            else:
+                out.append(round(std[t] / counts.get((d, k), 1), 2))
+        return out
+    o[PKT_SERVICE_COL] = svc(o)
+    n[PKT_SERVICE_COL] = svc(n)
+
+    o_out = o[PKT_COLUMNS + ['Term', 'Legal Number', 'Total Amount', '_date']].reset_index(drop=True)
+    n_out = n[PKT_COLUMNS].reset_index(drop=True)
+    is_no_so = o_out['OrderNo'] == 0
+    info = {
+        'orders': int((~is_no_so).sum()), 'no_so': int(is_no_so.sum()), 'rows': len(o_out),
+        'coords': int(o_out['Latitude'].notna().sum()), 'coords_no_so': int(o_out.loc[is_no_so, 'Latitude'].notna().sum()),
+        'type_f': int((o_out['Cust Type'] == 'F').sum()), 'type_r': int((o_out['Cust Type'] == 'R').sum()),
+        'type_blank': int(o_out['Cust Type'].isna().sum()), 'type_by_group': g1 + g2,
+        'unmatched': sorted(set(
+            (r['ShipTo Name'] or r['Customer Name'] or '') for _, r in pd.concat([o_out, n_out]).iterrows()
+            if pd.isna(r['Latitude']))),
+    }
+    return o_out, n_out, info
+
+
+def pkt_to_excel_bytes(orders_df, no_so_df, sheet1_df=None):
+    """Sheet1 ต้นฉบับ (ตัดแถว/คอลัมน์ว่าง) + ชีท Order (เทมเพลตใบงานภูเก็ต + Service Time + Lat/Lon)"""
+    wb = Workbook()
+    wb.remove(wb.active)
+    thin = Side(style='thin')
+    border = Border(top=thin, bottom=thin, left=thin, right=thin)
+    f_head = Font(name='Cordia New', size=14, bold=True)
+    f_body = Font(name='Cordia New', size=14)
+    if sheet1_df is not None and len(sheet1_df):
+        ws1 = wb.create_sheet(title='Sheet1')
+        for r_i, row in enumerate(sheet1_df.itertuples(index=False), start=1):
+            for c_i, v in enumerate(row, start=1):
+                if _cell_blank(v):
+                    continue
+                if isinstance(v, (pd.Timestamp, datetime)):
+                    v = v.strftime('%Y/%m/%d')
+                cell = ws1.cell(row=r_i, column=c_i, value=v)
+                cell.font = f_head if r_i == 1 else f_body
+        for c_i, col in enumerate(sheet1_df.columns, start=1):
+            width = max((len(str(v)) for v in sheet1_df[col] if not _cell_blank(v)), default=6)
+            ws1.column_dimensions[get_column_letter(c_i)].width = min(max(width + 2, 8), 50)
+    # ---- ชีท Order = ใบงานตามเทมเพลตภูเก็ต: หัวกระดาษ 2 แถว, หัวตารางแถว 3, Route ว่าง,
+    #      ต่อท้ายด้วย Service Time + Latitude + Longitude, ท้าย "รายชื่อ พขร." ----
+    ws = wb.create_sheet(title=PKT_JOB_SHEET)
+    f_top = Font(name='Cordia New', size=16, bold=True)
+    f_cell = Font(name='Aptos Narrow', size=11)       # ตารางใช้ฟอนต์เดียวกับเทมเพลตภูเก็ต
+    f_hcell = Font(name='Aptos Narrow', size=11, bold=True)
+    for r, text in enumerate(PKT_JOB_TOP, start=1):
+        c = ws.cell(row=r, column=1, value=text)
+        c.font = f_top
+        c.alignment = Alignment(horizontal='left', vertical='center')
+        ws.row_dimensions[r].height = 24.6
+    for c, name in enumerate(PKT_JOB_COLUMNS, start=1):
+        cell = ws.cell(row=3, column=c, value=name)
+        cell.font = f_hcell
+        cell.border = border
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    r = 3
+    for rec in orders_df.itertuples(index=False):
+        row_vals = dict(zip(orders_df.columns, rec))
+        d = row_vals.get('_date')
+        if isinstance(d, pd.Timestamp):
+            d = d.to_pydatetime()
+        amt = row_vals.get('Total Amount')
+        vals = [d, row_vals.get('OrderNo'), row_vals.get('Customer Name'), row_vals.get('ShipTo Name'),
+                row_vals.get('Term'), row_vals.get('Sales Person'), row_vals.get('Legal Number'),
+                None if (amt is None or (isinstance(amt, float) and pd.isna(amt))) else amt,
+                None, None, None, None,
+                row_vals.get(PKT_SERVICE_COL), row_vals.get('Latitude'), row_vals.get('Longitude')]
+        r += 1
+        for c, v in enumerate(vals, start=1):
+            if v is not None and isinstance(v, float) and pd.isna(v):
+                v = None
+            cell = ws.cell(row=r, column=c, value=v)
+            cell.font = f_cell
+            cell.border = border
+            cell.alignment = Alignment(vertical='center')
+            if c == 1 and isinstance(v, datetime):
+                cell.number_format = 'dd/mm/yyyy'
+            elif c == 8:
+                cell.number_format = '#,##0.00'
+    foot = r + 3
+    ws.merge_cells(start_row=foot, start_column=3, end_row=foot, end_column=11)
+    fc = ws.cell(row=foot, column=3, value=PKT_JOB_FOOTER)
+    fc.font = f_hcell
+    fc.alignment = Alignment(horizontal='left', vertical='center')
+    for c in range(3, 12):
+        ws.cell(row=foot, column=c).border = border
+    ws.row_dimensions[foot].height = 30
+    for c, w in enumerate(PKT_JOB_WIDTHS, start=1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+    ws.print_title_rows = '1:3'
+    ws.page_setup.orientation = 'landscape'
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _render_pkt():
+    if not MASTER_SHEET_CSV_URL:
+        st.error("⚠️ ยังไม่ได้ตั้งค่า MASTER_SHEET_CSV_URL — ดูวิธีตั้งค่าใน DEPLOY_INSTRUCTIONS.md")
+        return
+    st.markdown("##### 🏝️ For PKT — ทำใบงานจากไฟล์ดิบภูเก็ต (1 แถวต่อ 1 SO)")
+    pkt_file = st.file_uploader("อัพโหลดไฟล์ดิบภูเก็ต", type=['xls', 'xlsx'], label_visibility="collapsed", key="pkt_uploader")
+    if pkt_file is None:
+        return
+    pkt_bytes = pkt_file.read()
+    try:
+        pkt_orders, pkt_no_so, pkt_info = read_pkt_orders(pkt_bytes)
+    except Exception as e:
+        st.error(f"อ่านไฟล์ไม่ได้: {e}")
+        return
+
+    st.markdown(f"""
+    <div class="rcm-card">
+        📄 ชีท <b>{pkt_info['sheet']}</b>: {pkt_info['lines']:,} Invoice → <b>{pkt_info['orders']:,} SO</b> (ไม่ซ้ำ)
+        {f" · ไม่มีเลข SO {pkt_info['no_so']:,} Invoice" if pkt_info['no_so'] else ''}
+    </div>
+    """, unsafe_allow_html=True)
+
+    pkt_dates = sorted({str(d) for d in pd.concat([pkt_orders['Order Date'], pkt_no_so['Order Date']]) if d is not None})
+    if len(pkt_dates) > 1:
+        pkt_sel = st.multiselect("Inv Date ที่จะเอา (ค่าเริ่มต้น = ทุกวันที่มีในไฟล์)", options=pkt_dates,
+                                 default=pkt_dates, key="pkt_dates")
+        if not pkt_sel:
+            st.warning("⚠️ กรุณาเลือก Inv Date อย่างน้อย 1 วัน")
+            return
+    else:
+        pkt_sel = None
+
+    st.caption("⏱️ เวลาบริการมาตรฐานต่อร้าน (นาที) — หารเท่า ๆ กันตามจำนวน SO ที่ ShipTo Name เดียวกัน")
+    s1, s2 = st.columns(2)
+    with s1:
+        pkt_fs = st.number_input("Food Service", min_value=1.0, max_value=240.0, value=20.0, step=1.0, key="pkt_service_fs")
+    with s2:
+        pkt_rt = st.number_input("Retail", min_value=1.0, max_value=240.0, value=45.0, step=1.0, key="pkt_service_rt")
+
+    if st.button("🚀 ทำใบงาน For PKT", type="primary", use_container_width=True, key="pkt_btn"):
+        with st.spinner("🛰️ กำลังรวม SO และเติมพิกัด..."):
+            try:
+                master_df = load_master_data(MASTER_SHEET_CSV_URL)
+                channels = load_master_channels(MASTER_SHEET_CSV_URL)
+                o, n, res = process_pkt_orders(pkt_orders, pkt_no_so, master_df, channels,
+                                               dates=pkt_sel, fs_minutes=pkt_fs, retail_minutes=pkt_rt)
+                st.session_state['pkt_xlsx'] = pkt_to_excel_bytes(o, n, sheet1_df=bkk_sheet1_clean(pkt_bytes))
+                st.session_state['pkt_result'] = res
+                st.session_state['pkt_filename'] = pkt_file.name
+            except Exception as e:
+                st.error(f"เกิดข้อผิดพลาด: {e}")
+                st.exception(e)
+
+    if 'pkt_result' not in st.session_state or st.session_state.get('pkt_filename') != pkt_file.name:
+        return
+    res = st.session_state['pkt_result']
+    st.markdown(f"""
+    <div class="rcm-card rcm-card-success">
+        🎯 <b>เสร็จแล้ว!</b> {res['orders']:,} SO + ไม่มี SO {res['no_so']:,} · มีพิกัด {res['coords']:,} / {res['rows']:,}
+    </div>
+    """, unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        stat_box("SO", f"{res['orders']:,}", f"ไม่ซ้ำ · + Invoice ที่ไม่มี SO {res['no_so']:,}")
+    with c2:
+        stat_box("มีพิกัด", f"{res['coords']:,} / {res['rows']:,}", "แถวทั้งหมดในชีท Order")
+    with c3:
+        stat_box("CUST TYPE", f"F {res['type_f']:,} · R {res['type_r']:,}",
+                 f"ไม่ทราบประเภท {res['type_blank']:,} (Service Time ว่าง)")
+    notes = []
+    if res['no_so']:
+        notes.append(f"{res['no_so']:,} Invoice ไม่มีเลข SO (Order = 0) — เก็บไว้ในชีท Order ด้วย 1 แถวต่อ 1 Invoice")
+    if res['type_blank']:
+        notes.append(f"{res['type_blank']:,} SO ไม่ทราบว่าเป็น F หรือ R (Channel ใน Master ไม่ใช่ Food Service/Retail และ Group ในไฟล์ก็ไม่บอก) — ช่อง Service Time ว่างไว้ให้กรอกเอง")
+    if notes:
+        st.markdown('<div class="rcm-card rcm-card-warn">⚠️ <b>ข้อสังเกต</b><br>' + '<br>'.join('• ' + x for x in notes) + '</div>',
+                    unsafe_allow_html=True)
+    if res['unmatched']:
+        with st.expander(f"ร้านที่ยังไม่มีพิกัด ({len(res['unmatched']):,} ชื่อ) — เพิ่มใน Master แล้วกดทำใหม่"):
+            st.dataframe(pd.DataFrame({'ShipTo Name / Customer Name': res['unmatched']}),
+                         use_container_width=True, hide_index=True)
+    st.write("")
+    st.download_button(
+        "⬇️ ดาวน์โหลดใบงาน For PKT (Excel: Sheet1 + Order)",
+        data=st.session_state['pkt_xlsx'],
+        file_name=f"{pkt_file.name.rsplit('.', 1)[0]}_For_PKT.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True, key="pkt_download_btn",
+    )
+
+
+# ============================================================
 # แท็บของแต่ละพื้นที่
 #   BKK   : For BKK + ใส่พิกัด Lat/Lon + Weight Calculator (+ QR Code)
-#   PKT   : ใส่พิกัด Lat/Lon (+ QR Code)
+#   PKT   : For PKT + ใส่พิกัด Lat/Lon (+ QR Code)
 #   SAMUI : ใส่พิกัด Lat/Lon (+ QR Code)
 # ============================================================
 REGION_TABS = {
     'BKK': [("🏙️  For BKK", _render_bkk), ("📍  ใส่พิกัด Lat/Lon", _render_coords),
             ("⚖️  Weight Calculator", _render_weight), ("🔗  QR Code", _render_qr)],
-    'PKT': [("📍  ใส่พิกัด Lat/Lon", _render_coords), ("🔗  QR Code", _render_qr)],
+    'PKT': [("🏝️  For PKT", _render_pkt), ("📍  ใส่พิกัด Lat/Lon", _render_coords), ("🔗  QR Code", _render_qr)],
     'SAMUI': [("📍  ใส่พิกัด Lat/Lon", _render_coords), ("🔗  QR Code", _render_qr)],
 }
 
