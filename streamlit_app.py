@@ -1967,7 +1967,7 @@ def read_bkk_orders(file_bytes):
     c_type = col('cust type', 'customer type')
     c_cname = col('cust name', 'cust. name', 'customer name')
     c_sname = col('shipto name', 'ship to name', 'ship-to name')
-    c_addr = col('shipto.address', prefix='shipto.address')
+    c_addr = col('shipto.address', prefix='shipto.addr')   # 'ShipTo.Address2' / 'ShipTo.Addre' (หัวคอลัมน์ถูกตัด)
     if c_addr is None:
         c_addr = col('shipto.c')
     c_route = col('route')
@@ -3109,14 +3109,461 @@ def _render_pkt():
     )
 
 
+# ---------------- จับคู่ชื่อลูกค้า (อังกฤษ) -> รายชื่อภาษาไทยในชีท "file" ของ Manifest ----------------
+INTER_CHAINS = [
+    # (รหัสกลุ่ม, คำที่เจอในชื่อฝั่งไฟล์ route/Master, คำที่เจอในชื่อฝั่งรายชื่อไทย)
+    ('LOTUS', ['LOTUS', 'HYPERMARKET'], ['LOTUS', 'โลตัส']),
+    ('MAKRO', ['CP AXTRA PCL', 'MAKRO'], ['ซีพี แอ็กซ์ต้า', 'แม็คโคร', 'MAKRO']),
+    ('BIGC', ['BIG C'], ['BIG C', 'บิ๊กซี']),
+    ('VILLA', ['VILLA MARKET'], ['วิลล่า มาร์เก็ต', 'VILLA MARKET']),
+    ('CFR', ['CENTRAL FOOD RETAIL', 'TOPS'], ['เซ็นทรัลฟู้ดรีเทล', 'CENTRAL FOOD RET', 'ท็อปส์', 'TOPS']),
+    ('MALL', ['THE MALL', 'DHL SUPPLY'], ['THE MALL', 'เดอะมอลล์']),
+    ('MOTHER', ['MOTHER MARKETING'], ['มาเธอร์ มาร์เก็ตติ้ง', 'MOTHER MARKETING']),
+    ('FOODLAND', ['FOODLAND'], ['FOODLAND', 'ฟู้ดแลนด์']),
+    ('HEALTHSOC', ['HEALTH SOCIETY'], ['HEALTH SOCIETY']),
+    ('AEON', ['AEON'], ['AEON', 'อิออน']),
+    ('ASIABOOKS', ['ASIA BOOK'], ['เอเซียบุ๊คส์', 'ASIA BOOK']),
+    ('TANTRAPAN', ['TANTRAPAN'], ['ตันตราภัณฑ์', 'TANTRAPAN']),
+]
+_INTER_STOP = {'CO', 'LTD', 'PCL', 'PUBLIC', 'COMPANY', 'LIMITED', 'PART', 'THE', 'SUPERCENTER', 'HYPERMARKET',
+               'SUPERMARKET', 'BRANCH', 'MR', 'MRS', 'MISS', 'KHUN', 'CREDIT', 'DC', 'HEAD', 'OFFICE'}
+_THAI_RE = re.compile(r'[฀-๿]+(?:\s+[฀-๿]+)*')
+
+
+def _inter_romanize(text):
+    """แปลงส่วนที่เป็นภาษาไทยเป็นตัวอักษรโรมัน (ใช้เทียบกับชื่อภาษาอังกฤษ) ส่วนที่เป็นอังกฤษคงเดิม"""
+    s = '' if text is None else str(text)
+    try:
+        from pythainlp.transliterate import romanize
+    except Exception:
+        return s
+    return _THAI_RE.sub(lambda m: ' ' + romanize(m.group(0), engine='royin') + ' ', s)
+
+
+def _inter_tokens(text, chain=None):
+    """ข้อความ -> ชุดคำ (ตัวพิมพ์ใหญ่ ตัดเครื่องหมาย ตัดคำบริษัท/ชื่อเครือออก)"""
+    s = _inter_romanize(text).upper()
+    if chain:
+        for c_id, a, b in INTER_CHAINS:
+            if c_id == chain:
+                for w in a + b:
+                    s = s.replace(w.upper(), ' ')
+    s = re.sub(r'[^A-Z0-9]+', ' ', s)
+    return [t for t in s.split() if t not in _INTER_STOP]
+
+
+def _inter_chain(text, side):
+    s = '' if text is None else str(text).upper()
+    for c_id, route_words, thai_words in INTER_CHAINS:
+        words = route_words if side == 'route' else thai_words
+        if any(w.upper() in s for w in words):
+            return c_id
+    return None
+
+
+def _inter_house_no(text):
+    """เลขที่บ้าน/อาคารตัวแรกในที่อยู่ เช่น '244', '34/54', '99/27'"""
+    m = re.search(r'(\d+(?:/\d+)?)', '' if text is None else str(text))
+    return m.group(1) if m else None
+
+
+def inter_build_directory(rows):
+    """rows = [(ชื่อ, ที่อยู่, อำเภอ/เขต, จังหวัด), ...] จากชีท file -> list ของ dict พร้อมคำที่ใช้เทียบ"""
+    out, seen = [], set()
+    for name, addr, dist, prov in rows:
+        if _cell_blank(name):
+            continue
+        key = (str(name).strip(), str(addr or '').strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        chain = _inter_chain(name, 'thai')
+        out.append({
+            'name': str(name).strip(), 'addr': None if _cell_blank(addr) else str(addr).strip(),
+            'dist': None if _cell_blank(dist) else str(dist).strip(),
+            'prov': None if _cell_blank(prov) else str(prov).strip(),
+            'chain': chain,
+            'tok': ' '.join(_inter_tokens(name, chain)),
+            'full': ' '.join(_inter_tokens(name)),
+            'loc': ' '.join(_inter_tokens(f'{dist or ""} {prov or ""} {addr or ""}')),
+            'house': _inter_house_no(addr),
+        })
+    return out
+
+
+def inter_match(ship_name, master_addr, master_city, master_prov, directory):
+    """หาแถวในรายชื่อไทยที่ตรงกับลูกค้า -> (index หรือ None, คะแนน 0-100, คะแนนร้านอันดับ 2, เลขที่บ้านตรงร้านเดียว)
+    คะแนน = ชื่อ (สาขา) 60% + ทำเล (อำเภอ/จังหวัด) 25% + เลขที่บ้านตรงกัน 15%
+    ถ้าชื่อเป็นเครือร้าน (Lotus, Makro, Big C, ...) เทียบเฉพาะในเครือเดียวกัน"""
+    from rapidfuzz import fuzz
+    chain = _inter_chain(ship_name, 'route')
+    q_tok = ' '.join(_inter_tokens(ship_name, chain))
+    q_full = ' '.join(_inter_tokens(ship_name))
+    q_loc = ' '.join(_inter_tokens(f'{master_city or ""} {master_prov or ""} {master_addr or ""}'))
+    q_house = _inter_house_no(master_addr)
+    scored = []
+    for i, d in enumerate(directory):
+        if chain and d['chain'] != chain:
+            continue
+        if chain:
+            name_s = max(fuzz.token_set_ratio(q_tok, d['tok']), fuzz.partial_ratio(q_tok.replace(' ', ''), d['tok'].replace(' ', ''))
+                         if q_tok and d['tok'] else 0)
+        else:
+            name_s = max(fuzz.token_set_ratio(q_full, d['full']), fuzz.ratio(q_full, d['full']))
+        loc_s = fuzz.token_set_ratio(q_loc, d['loc']) if q_loc and d['loc'] else 0
+        house_s = 100 if (q_house and d['house'] and q_house == d['house']) else 0
+        scored.append((0.60 * name_s + 0.25 * loc_s + 0.15 * house_s, i, house_s > 0))
+    if not scored:
+        return None, 0, 0, False
+    scored.sort(reverse=True)
+    best = scored[0]
+    # อันดับ 2 = ร้านอื่นจริง ๆ (ข้ามแถวที่ซ้ำกันในรายชื่อ เช่นชื่อ/ที่อยู่เดียวกันพิมพ์ไว้ 2 ครั้ง)
+    def same_place(i, j):
+        di, dj = directory[i], directory[j]
+        if di['house'] and dj['house']:
+            return di['house'] == dj['house'] and re.sub(r'\s+', '', str(di['dist'] or '')) == re.sub(r'\s+', '', str(dj['dist'] or ''))
+        return re.sub(r'\s+', '', str(di['addr'] or '')) == re.sub(r'\s+', '', str(dj['addr'] or ''))
+    others = [(sc, i, h) for sc, i, h in scored[1:] if not same_place(best[1], i)]
+    second = others[0][0] if others else 0
+    # เลขที่บ้านตรงกับร้านนี้ร้านเดียว (ร้านอื่นในกลุ่มไม่มีเลขนี้) = หลักฐานแรงว่าเป็นร้านเดียวกัน
+    house_unique = best[2] and not any(h for _, _, h in others)
+    return best[1], round(best[0], 1), round(second, 1), house_unique
+
+
+# ============================================================
+# TAB (BKK): InterExp Manifest — ออเดอร์ Route InterExp -> ไฟล์ Manifest ของ Inter Express
+#   ใช้ไฟล์เทมเพลตของทีมตามเดิมทุกอย่าง (รูป โลโก้ checkbox ฟอร์แมต) แก้เฉพาะค่าในช่องข้อมูล
+#   ชื่อ/ที่อยู่ภาษาไทย ดึงจากชีท "file" ในเทมเพลต (จับคู่จากชื่อภาษาอังกฤษใน Sheet1)
+# ============================================================
+INTER_FIRST_ROW, INTER_ROWS_PER_SHEET = 8, 10          # ข้อมูลอยู่แถว 8-17 (10 แถวต่อแผ่น)
+INTER_COLD_PREFIX, INTER_NORMAL_PREFIX = ('3', '4'), ('1', '2')
+INTER_TYPE_COLD, INTER_TYPE_NORMAL = 'ยาเย็น', 'ยาธรรมดา'
+INTER_SERVICE, INTER_TEMP = 'ขนส่งกล่องโฟมเย็น', 'chill 0-5 องศา'
+INTER_AUTO_SCORE, INTER_AUTO_GAP = 70, 5               # คะแนนขั้นต่ำ / ห่างจากอันดับ 2 ที่ให้เลือกอัตโนมัติ
+INTER_HOUSE_SCORE = 55                                  # ถ้าเลขที่บ้านตรงร้านเดียว ใช้คะแนนขั้นต่ำนี้
+INTER_NONE = '— ไม่เลือก (ใช้ชื่อ/ที่อยู่ภาษาอังกฤษ) —'
+
+
+def _inter_is_route(route, include_bw):
+    key = re.sub(r'[^A-Z0-9]', '', str(route).upper()) if route is not None else ''
+    if key.startswith('INTEREXP'):
+        return True
+    return include_bw and key in ('IEBW', 'BW', 'IE')
+
+
+def inter_order_rows(orders, lines_df, include_bw=False, dates=None):
+    """ออเดอร์ Route InterExp -> แถวใน Manifest
+    ประเภทสินค้าดูจากตัวแรกของ Product Code: 1, 2 = ยาธรรมดา / 3, 4 = ยาเย็น
+    ออเดอร์ที่มีทั้งสองแบบ -> แยกเป็น 2 แถว (แถวละประเภท)"""
+    df = orders[orders['Route'].map(lambda r: _inter_is_route(r, include_bw))].copy()
+    if dates is not None:
+        keep = set(str(d) for d in dates)
+        df = df[df['Order Date'].astype(str).isin(keep)]
+    codes = {}
+    for o, c in zip(lines_df['OrderNo'], lines_df['Product Code']):
+        codes.setdefault(o, set()).add(str(c).strip()[:1])
+    rows = []
+    df = df.assign(_ok=df['OrderNo'].map(lambda v: (0, v, '') if isinstance(v, int) else (1, 0, str(v))))
+    for _, r in df.sort_values('_ok', kind='stable').iterrows():
+        first = codes.get(r['OrderNo'], set())
+        kinds = []
+        if first & set(INTER_NORMAL_PREFIX) or not (first & set(INTER_COLD_PREFIX)):
+            kinds.append(INTER_TYPE_NORMAL)
+        if first & set(INTER_COLD_PREFIX):
+            kinds.append(INTER_TYPE_COLD)
+        for k in kinds:
+            rows.append({'OrderNo': r['OrderNo'], 'Order Date': r['Order Date'], 'Route': r['Route'],
+                         'ShipTo Name': r['ShipTo Name'] or r['Customer Name'], 'Customer Name': r['Customer Name'],
+                         'ShipTo.Address': r['ShipTo.Address'], 'ประเภทสินค้า': k,
+                         'รหัสสินค้า': ', '.join(sorted(first)) if first else '',
+                         'แยกแถว': len(kinds) > 1,
+                         'unknown_code': bool(first - set(INTER_NORMAL_PREFIX) - set(INTER_COLD_PREFIX))})
+    return pd.DataFrame(rows)
+
+
+def inter_template_directory(template_bytes):
+    """ชีท "file" ในเทมเพลต: กลุ่มละ 4 คอลัมน์ (ชื่อ, ที่อยู่, อำเภอ/เขต, จังหวัด) วางเรียงกันไปทางขวา"""
+    wb = load_workbook(io.BytesIO(template_bytes), read_only=True, data_only=True)
+    if 'file' not in wb.sheetnames:
+        raise ValueError('ไม่พบชีท "file" (รายชื่อภาษาไทย) ในไฟล์เทมเพลต')
+    rows = []
+    for r in wb['file'].iter_rows(values_only=True):
+        r = list(r)
+        for off in range(0, len(r), 5):
+            block = (r[off:off + 4] + [None] * 4)[:4]
+            if not _cell_blank(block[0]):
+                rows.append(tuple(block))
+    wb.close()
+    return rows
+
+
+@st.cache_data(show_spinner=False)
+def inter_directory_cached(template_bytes):
+    return inter_build_directory(inter_template_directory(template_bytes))
+
+
+def _inter_label(d):
+    return f"{d['name']}  |  {d['addr'] or '-'}  |  {d['dist'] or '-'}  |  {d['prov'] or '-'}"
+
+
+def inter_suggest(rows, master_df, directory):
+    """เติมคำแนะนำชื่อไทยให้ทุกแถว -> DataFrame พร้อมคอลัมน์ ชื่อไทย (เลือกให้อัตโนมัติถ้ามั่นใจ), แนะนำ, คะแนน"""
+    by_ship = master_df.drop_duplicates('norm_ship').set_index('norm_ship')
+    cache, out = {}, []
+    for _, r in rows.iterrows():
+        name = r['ShipTo Name']
+        key = normalize(name)
+        if key not in cache:
+            addr = city = prov = None
+            if key in by_ship.index:
+                hit = by_ship.loc[key]
+                addr, city, prov = hit.get('Ship To Address'), hit.get('Ship To City'), hit.get('Ship to State/Prov')
+            if _cell_blank(addr):
+                addr = r['ShipTo.Address']
+            cache[key] = (inter_match(name, addr, city, prov, directory), addr, city, prov)
+        (idx, score, second, house_unique), addr, city, prov = cache[key]
+        label = _inter_label(directory[idx]) if idx is not None else ''
+        # เลือกให้อัตโนมัติเมื่อมั่นใจ: คะแนนสูงและห่างจากร้านอันดับ 2 ชัดเจน หรือเลขที่บ้านตรงกับร้านนี้ร้านเดียว
+        auto = idx is not None and ((score >= INTER_AUTO_SCORE and score - second >= INTER_AUTO_GAP)
+                                    or (house_unique and score >= INTER_HOUSE_SCORE))
+        out.append({'เลือกชื่อไทย': label if auto else INTER_NONE, 'คำแนะนำ': label, 'คะแนน': score,
+                    'สถานะ': '✅ อัตโนมัติ' if auto else '⚠️ ต้องตรวจ',
+                    '_en_addr': None if _cell_blank(addr) else str(addr),
+                    '_en_city': None if _cell_blank(city) else str(city),
+                    '_en_prov': None if _cell_blank(prov) else str(prov)})
+    return pd.concat([rows.reset_index(drop=True), pd.DataFrame(out)], axis=1)
+
+
+# ---------- เขียนค่าลงเทมเพลตแบบแก้ XML ตรง ๆ (ไม่เปิด/บันทึกด้วย openpyxl เพราะจะทำให้รูป, checkbox, OLE หาย) ----------
+def _inter_xml_escape(s):
+    return (str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;'))
+
+
+def _inter_set_cells(xml, values):
+    """values = {'A8': ค่า, ...} -> แทนเฉพาะช่องนั้นใน sheet XML คง style (s=) ของช่องเดิมไว้"""
+    for ref, v in values.items():
+        pat = re.compile(r'<c r="%s"(?P<attrs>[^>]*?)(?:/>|>.*?</c>)' % ref, re.S)
+        m = pat.search(xml)
+        if not m:
+            continue
+        sm = re.search(r'\ss="(\d+)"', m.group('attrs'))
+        s_attr = f' s="{sm.group(1)}"' if sm else ''
+        if v is None or (isinstance(v, float) and pd.isna(v)) or (isinstance(v, str) and v == ''):
+            new = f'<c r="{ref}"{s_attr}/>'
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            new = f'<c r="{ref}"{s_attr}><v>{v}</v></c>'
+        else:
+            new = f'<c r="{ref}"{s_attr} t="inlineStr"><is><t xml:space="preserve">{_inter_xml_escape(v)}</t></is></c>'
+        xml = xml[:m.start()] + new + xml[m.end():]
+    return xml
+
+
+def _inter_sheet_paths(zf):
+    """[(ชื่อชีท, path ของ xml)] ตามลำดับในไฟล์"""
+    wb = zf.read('xl/workbook.xml').decode('utf-8')
+    rels = zf.read('xl/_rels/workbook.xml.rels').decode('utf-8')
+    rid_target = {}
+    for m in re.finditer(r'<Relationship [^>]*>', rels):
+        tag = m.group(0)
+        rid = re.search(r'Id="([^"]+)"', tag)
+        tgt = re.search(r'Target="([^"]+)"', tag)
+        if rid and tgt:
+            t = tgt.group(1).lstrip('/')
+            rid_target[rid.group(1)] = t if t.startswith('xl/') else 'xl/' + t
+    out = []
+    for m in re.finditer(r'<sheet [^>]*>', wb):
+        tag = m.group(0)
+        name = re.search(r'name="([^"]+)"', tag).group(1)
+        rid = re.search(r'r:id="([^"]+)"', tag).group(1)
+        out.append((name.replace('&amp;', '&'), rid_target.get(rid)))
+    return out
+
+
+def inter_build_manifests(template_bytes, rows, sheet_date, deliver_text):
+    """rows: DataFrame (หลังผู้ใช้เลือกชื่อไทยแล้ว) -> [(ชื่อไฟล์, bytes)]
+    แผ่นละ 10 แถว ใส่ลงชีท inter 1, inter 2, ... ตามลำดับ ถ้าเกินจำนวนชีทในเทมเพลตจะต่อไฟล์ใหม่ (เทมเพลตเดิม)
+    ชีท inter ที่ไม่ได้ใช้ -> ล้างข้อมูลเก่าออก (เหลือหัวกระดาษ/ฟอร์มเปล่า) ชีทอื่น (file, Hotel, ...) ไม่แตะ"""
+    import zipfile
+    zin = zipfile.ZipFile(io.BytesIO(template_bytes))
+    inter_sheets = [(n, p) for n, p in _inter_sheet_paths(zin) if re.fullmatch(r'inter\s*\d+', n.strip(), re.I)]
+    if not inter_sheets:
+        raise ValueError('ไม่พบชีท "inter 1", "inter 2", ... ในไฟล์เทมเพลต')
+    recs = rows.to_dict('records')
+    pages = [recs[i:i + INTER_ROWS_PER_SHEET] for i in range(0, len(recs), INTER_ROWS_PER_SHEET)] or [[]]
+    per_file = len(inter_sheets)
+    n_files = (len(pages) + per_file - 1) // per_file
+    total_pages = len(pages)
+    files = []
+    for f_i in range(n_files):
+        file_pages = pages[f_i * per_file:(f_i + 1) * per_file]
+        new_xml = {}
+        for s_i, (sname, path) in enumerate(inter_sheets):
+            xml = zin.read(path).decode('utf-8')
+            page = file_pages[s_i] if s_i < len(file_pages) else None
+            vals = {}
+            if page is not None:
+                page_no = f_i * per_file + s_i + 1
+                vals['A4'] = f'หน้าแรก แผ่นที่ {page_no} /…{total_pages}… \nวันที่ {sheet_date}............................'
+            for k in range(INTER_ROWS_PER_SHEET):
+                r = INTER_FIRST_ROW + k
+                rec = page[k] if (page is not None and k < len(page)) else None
+                if rec is None:
+                    for col in 'ABCDEFGHIJKLMNO':
+                        vals[f'{col}{r}'] = None
+                    continue
+                seq = (f_i * per_file + s_i) * INTER_ROWS_PER_SHEET + k + 1
+                vals.update({
+                    f'A{r}': seq, f'B{r}': rec['เลขที่บิล'], f'C{r}': rec['ชื่อผู้รับ'], f'D{r}': rec['ที่อยู่'],
+                    f'E{r}': rec['อำเภอ/เขต'], f'F{r}': rec['จังหวัด'], f'G{r}': None,
+                    f'H{r}': rec['ประเภทสินค้า'], f'I{r}': INTER_SERVICE, f'J{r}': INTER_TEMP,
+                    f'K{r}': None, f'L{r}': None, f'M{r}': None, f'N{r}': None, f'O{r}': deliver_text,
+                })
+            new_xml[path] = _inter_set_cells(xml, vals)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = new_xml[item.filename].encode('utf-8') if item.filename in new_xml else zin.read(item.filename)
+                zout.writestr(item, data)
+        files.append((f_i + 1, buf.getvalue()))
+    return files, total_pages
+
+
+def inter_final_rows(edited, directory):
+    """ผลที่ผู้ใช้เลือกในตาราง -> ข้อมูลที่จะลง Manifest (ไม่เลือกชื่อไทย = ใช้ภาษาอังกฤษจาก Master/Sheet1)"""
+    by_label = {_inter_label(d): d for d in directory}
+    out = []
+    for _, r in edited.iterrows():
+        d = by_label.get(r['เลือกชื่อไทย'])
+        if d is not None:
+            name, addr, dist, prov, thai = d['name'], d['addr'], d['dist'], d['prov'], True
+        else:
+            name, addr, dist, prov, thai = r['ShipTo Name'], r['_en_addr'], r['_en_city'], r['_en_prov'], False
+        out.append({'เลขที่บิล': str(r['OrderNo']), 'ชื่อผู้รับ': name, 'ที่อยู่': addr, 'อำเภอ/เขต': dist,
+                    'จังหวัด': prov, 'ประเภทสินค้า': r['ประเภทสินค้า'], '_thai': thai})
+    return pd.DataFrame(out)
+
+
+def _render_inter():
+    if not MASTER_SHEET_CSV_URL:
+        st.error("⚠️ ยังไม่ได้ตั้งค่า MASTER_SHEET_CSV_URL — ดูวิธีตั้งค่าใน DEPLOY_INSTRUCTIONS.md")
+        return
+    st.markdown("##### 📦 InterExp Manifest — ทำใบ Manifest ของ Inter Express จาก Sheet1")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.caption("1) ไฟล์ route (Sheet1)")
+        route_file = st.file_uploader("ไฟล์ route", type=['xls', 'xlsx'], label_visibility="collapsed", key="inter_route")
+    with c2:
+        st.caption("2) ไฟล์เทมเพลต Manifest (ต้องมีชีท file และ inter 1, inter 2, ...)")
+        tpl_file = st.file_uploader("เทมเพลต Manifest", type=['xlsx'], label_visibility="collapsed", key="inter_tpl")
+    if route_file is None or tpl_file is None:
+        return
+    route_bytes, tpl_bytes = route_file.getvalue(), tpl_file.getvalue()
+    try:
+        orders, info = read_bkk_orders(route_bytes)
+        directory = inter_directory_cached(tpl_bytes)
+    except Exception as e:
+        st.error(f"อ่านไฟล์ไม่ได้: {e}")
+        return
+    try:
+        import pythainlp  # noqa: F401
+    except Exception:
+        st.warning("⚠️ ยังไม่ได้ติดตั้ง pythainlp (เพิ่มใน requirements.txt) — จับคู่ชื่อไทยได้น้อยลง ต้องเลือกเองมากขึ้น")
+
+    include_bw = st.checkbox("รวม Route IE,B&W ด้วย", value=False, key="inter_bw")
+    all_inter = orders[orders['Route'].map(lambda r: _inter_is_route(r, include_bw))]
+    dates = sorted({str(d) for d in all_inter['Order Date'] if d is not None})
+    sel_dates = None
+    if len(dates) > 1:
+        sel_dates = st.multiselect("Order Date ที่จะเอา", options=dates, default=dates, key="inter_dates")
+    d1, d2 = st.columns(2)
+    today = datetime.now()
+    with d1:
+        sheet_date = st.date_input("วันที่ในใบ Manifest", value=today, key="inter_sheet_date", format="DD/MM/YYYY")
+    with d2:
+        deliver_date = st.date_input("ส่งถึง (หมายเหตุ)", value=today + pd.Timedelta(days=1), key="inter_deliver", format="DD/MM/YYYY")
+
+    rows = inter_order_rows(orders, info['lines_df'], include_bw=include_bw, dates=sel_dates)
+    if rows.empty:
+        st.warning("ไม่พบออเดอร์ Route InterExp ใน Sheet1")
+        return
+    sig = (route_file.name, len(route_bytes), tpl_file.name, len(tpl_bytes), include_bw, tuple(sel_dates or []))
+    if st.session_state.get('inter_sig') != sig:
+        with st.spinner("🔎 กำลังจับคู่ชื่อภาษาไทย..."):
+            master_df = load_master_data(MASTER_SHEET_CSV_URL)
+            st.session_state['inter_table'] = inter_suggest(rows, master_df, directory)
+            st.session_state['inter_sig'] = sig
+    table = st.session_state['inter_table']
+    n_auto = int((table['สถานะ'] == '✅ อัตโนมัติ').sum())
+    n_split = int(rows['แยกแถว'].sum())
+    st.markdown(f"""
+    <div class="rcm-card">
+        📄 InterExp {rows['OrderNo'].nunique():,} ออเดอร์ → <b>{len(rows):,} แถว</b> ({(len(rows) + 9) // 10:,} แผ่น แผ่นละ 10)
+        · จับคู่ชื่อไทยอัตโนมัติ {n_auto:,} / {len(rows):,} แถว
+        {f" · มี {n_split:,} แถวที่มาจากออเดอร์ที่มีทั้งยาธรรมดาและยาเย็น (แยกเป็น 2 แถว)" if n_split else ''}
+    </div>
+    """, unsafe_allow_html=True)
+    st.caption("ตรวจช่อง \"เลือกชื่อไทย\" — แถว ⚠️ ระบบไม่มั่นใจ ให้เลือกเองจากรายการ (พิมพ์ค้นหาได้) ถ้าไม่เลือก จะใช้ชื่อ/ที่อยู่ภาษาอังกฤษแทน")
+    if st.button("💡 ใส่คำแนะนำในแถว ⚠️ ที่ยังไม่ได้เลือก (แล้วค่อยแก้แถวที่ผิด)", key="inter_fill_btn"):
+        t = st.session_state['inter_table']
+        mask = (t['เลือกชื่อไทย'] == INTER_NONE) & (t['คำแนะนำ'] != '')
+        t.loc[mask, 'เลือกชื่อไทย'] = t.loc[mask, 'คำแนะนำ']
+        st.session_state['inter_table'] = t
+        st.session_state['inter_editor_ver'] = st.session_state.get('inter_editor_ver', 0) + 1
+        table = t
+    options = [INTER_NONE] + sorted({_inter_label(d) for d in directory})
+    show_cols = ['สถานะ', 'OrderNo', 'ShipTo Name', 'ประเภทสินค้า', 'เลือกชื่อไทย', 'คำแนะนำ', 'คะแนน']
+    edited = st.data_editor(
+        table[show_cols + ['_en_addr', '_en_city', '_en_prov']],
+        column_config={
+            'เลือกชื่อไทย': st.column_config.SelectboxColumn('เลือกชื่อไทย', options=options, width='large', required=True),
+            'คำแนะนำ': st.column_config.TextColumn('คำแนะนำ (คะแนนสูงสุด)', width='large'),
+            'คะแนน': st.column_config.NumberColumn('คะแนน', format="%.0f"),
+            '_en_addr': None, '_en_city': None, '_en_prov': None,
+        },
+        disabled=['สถานะ', 'OrderNo', 'ShipTo Name', 'ประเภทสินค้า', 'คำแนะนำ', 'คะแนน'],
+        hide_index=True, use_container_width=True, key=f"inter_editor_{st.session_state.get('inter_editor_ver', 0)}",
+    )
+    if st.button("🚀 สร้างไฟล์ Manifest", type="primary", use_container_width=True, key="inter_btn"):
+        try:
+            final = inter_final_rows(edited, directory)
+            files, pages = inter_build_manifests(
+                tpl_bytes, final, sheet_date.strftime('%d/%m/%Y'),
+                f"ส่งถึง {deliver_date.strftime('%d/%m/%y')} ก่อน 12.00 น.")
+            st.session_state['inter_files'] = files
+            st.session_state['inter_result'] = {'rows': len(final), 'pages': pages,
+                                                'english': int((~final['_thai']).sum()), 'sig': sig}
+        except Exception as e:
+            st.error(f"เกิดข้อผิดพลาด: {e}")
+            st.exception(e)
+    res = st.session_state.get('inter_result')
+    if not res or res.get('sig') != sig:
+        return
+    msg = f"🎯 <b>เสร็จแล้ว!</b> {res['rows']:,} แถว · {res['pages']:,} แผ่น"
+    if res['english']:
+        msg += f" · ⚠️ {res['english']:,} แถวยังเป็นภาษาอังกฤษ (ไม่ได้เลือกชื่อไทย)"
+    st.markdown(f'<div class="rcm-card rcm-card-success">{msg}</div>', unsafe_allow_html=True)
+    files = st.session_state['inter_files']
+    base = tpl_file.name.rsplit('.', 1)[0]
+    stamp = sheet_date.strftime('%d.%m.%y')
+    if len(files) > 1:
+        st.info(f"แผ่นเกินจำนวนชีท inter ในเทมเพลต — แบ่งเป็น {len(files)} ไฟล์ (เลขแผ่นต่อเนื่องกัน)")
+    for no, data in files:
+        st.download_button(
+            f"⬇️ ดาวน์โหลด Manifest{'' if len(files) == 1 else f' ไฟล์ {no}'}",
+            data=data, file_name=f"{base}_{stamp}{'' if len(files) == 1 else f'_{no}'}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, key=f"inter_dl_{no}",
+        )
+
+
 # ============================================================
 # แท็บของแต่ละพื้นที่
-#   BKK   : For BKK + ใส่พิกัด Lat/Lon + Weight Calculator (+ QR Code)
+#   BKK   : For BKK + InterExp Manifest + ใส่พิกัด Lat/Lon + Weight Calculator (+ QR Code)
 #   PKT   : For PKT + ใส่พิกัด Lat/Lon (+ QR Code)
 #   SAMUI : ใส่พิกัด Lat/Lon (+ QR Code)
 # ============================================================
 REGION_TABS = {
-    'BKK': [("🏙️  For BKK", _render_bkk), ("📍  ใส่พิกัด Lat/Lon", _render_coords),
+    'BKK': [("🏙️  For BKK", _render_bkk), ("📦  InterExp Manifest", _render_inter), ("📍  ใส่พิกัด Lat/Lon", _render_coords),
             ("⚖️  Weight Calculator", _render_weight), ("🔗  QR Code", _render_qr)],
     'PKT': [("🏝️  For PKT", _render_pkt), ("📍  ใส่พิกัด Lat/Lon", _render_coords), ("🔗  QR Code", _render_qr)],
     'SAMUI': [("📍  ใส่พิกัด Lat/Lon", _render_coords), ("🔗  QR Code", _render_qr)],
