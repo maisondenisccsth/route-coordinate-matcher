@@ -3436,12 +3436,148 @@ def _inter_add_review_sheet(zin, review, new_xml, add_parts):
     add_parts[part] = sheet_xml
 
 
+def _inter_rels_path(part):
+    d, b = part.rsplit('/', 1) if '/' in part else ('', part)
+    return f'{d}/_rels/{b}.rels' if d else f'_rels/{b}.rels'
+
+
+def _inter_resolve(base_part, target):
+    import posixpath
+    if target.startswith('/'):
+        return target.lstrip('/')
+    base_dir = posixpath.dirname(base_part)
+    return posixpath.normpath(posixpath.join(base_dir, target))
+
+
+def _inter_drop_sheets(parts, drop_names):
+    """ลบชีทตามชื่อออกจากไฟล์ xlsx (parts = {ชื่อไฟล์ใน zip: bytes}) แก้ workbook/rels/content types/print area/app.xml
+    แล้วลบไฟล์ที่ไม่มีใครอ้างถึงแล้ว (รูป/OLE/checkbox ของชีทที่ลบ) — ชีทที่เหลือไม่แตะ"""
+    drop = set(drop_names)
+    if not drop:
+        return
+    wb = parts['xl/workbook.xml'].decode('utf-8')
+    rels = parts['xl/_rels/workbook.xml.rels'].decode('utf-8')
+    sheet_tags = re.findall(r'<sheet [^>]*/>', wb)
+    names = [re.search(r'name="([^"]+)"', t).group(1).replace('&amp;', '&') for t in sheet_tags]
+    drop_idx = [i for i, n in enumerate(names) if n in drop]
+    if not drop_idx:
+        return
+    new_index = {}
+    for i, n in enumerate(names):
+        if i not in drop_idx:
+            new_index[i] = i - sum(1 for d in drop_idx if d < i)
+    drop_rids = set()
+    for i in drop_idx:
+        tag = sheet_tags[i]
+        drop_rids.add(re.search(r'r:id="([^"]+)"', tag).group(1))
+        wb = wb.replace(tag, '', 1)
+
+    def fix_name(m):
+        tag, body = m.group(1), m.group(2)
+        lm = re.search(r'localSheetId="(\d+)"', tag)
+        if lm:
+            old = int(lm.group(1))
+            if old in drop_idx:
+                return ''
+            tag = tag.replace(lm.group(0), f'localSheetId="{new_index[old]}"')
+        if any(f"'{n}'!" in body or f'{n}!' in body for n in drop):
+            return ''
+        return f'{tag}{body}</definedName>'
+    wb = re.sub(r'(<definedName [^>]*>)(.*?)</definedName>', fix_name, wb, flags=re.S)
+    wb = wb.replace('<definedNames></definedNames>', '')
+    # แท็บที่เปิดอยู่ตอนเปิดไฟล์: ถ้าชีทเดิมยังอยู่ใช้ตัวเดิม ไม่งั้นไปที่ inter แผ่นแรก
+    am = re.search(r'activeTab="(\d+)"', wb)
+    old_active = int(am.group(1)) if am else 0
+    if old_active in new_index:
+        new_active = new_index[old_active]
+    else:
+        new_active = next((new_index[i] for i, n in enumerate(names) if i in new_index and re.fullmatch(r'inter\s*\d+', n.strip(), re.I)), 0)
+        # ให้ชีทนั้นถูกเลือก (tabSelected) — หาไฟล์ของชีทนั้น
+        tgt_name = [n for i, n in enumerate(names) if new_index.get(i) == new_active][0]
+        for n, p in _inter_sheet_paths_from(wb, rels):
+            if n == tgt_name and p in parts:
+                x = parts[p].decode('utf-8')
+                if 'tabSelected=' not in x:
+                    x = re.sub(r'<sheetView(?=[\s>])', '<sheetView tabSelected="1"', x, count=1)
+                parts[p] = x.encode('utf-8')
+    if am:
+        wb = wb.replace(am.group(0), f'activeTab="{new_active}"', 1)
+    wb = re.sub(r'firstSheet="\d+"', 'firstSheet="0"', wb)
+    for rid in drop_rids:
+        rels = re.sub(rf'<Relationship [^>]*Id="{re.escape(rid)}"[^>]*/>', '', rels)
+    parts['xl/workbook.xml'] = wb.encode('utf-8')
+    parts['xl/_rels/workbook.xml.rels'] = rels.encode('utf-8')
+
+    # app.xml: รายชื่อชีท/ชื่อ Print_Area
+    if 'docProps/app.xml' in parts:
+        app = parts['docProps/app.xml'].decode('utf-8')
+        tm = re.search(r'<TitlesOfParts><vt:vector size="(\d+)" baseType="lpstr">(.*?)</vt:vector></TitlesOfParts>', app, re.S)
+        hm = re.search(r'<HeadingPairs><vt:vector[^>]*>(.*?)</vt:vector></HeadingPairs>', app, re.S)
+        if tm and hm:
+            items = re.findall(r'<vt:lpstr>(.*?)</vt:lpstr>', tm.group(2), re.S)
+            pairs = re.findall(r'<vt:variant><vt:lpstr>(.*?)</vt:lpstr></vt:variant><vt:variant><vt:i4>(\d+)</vt:i4></vt:variant>', hm.group(1), re.S)
+            if sum(int(c) for _, c in pairs) == len(items):
+                pos, new_pairs, new_items = 0, [], []
+                for label, cnt in pairs:
+                    grp = items[pos:pos + int(cnt)]
+                    pos += int(cnt)
+                    kept = [it for it in grp
+                            if it.replace('&amp;', '&') not in drop
+                            and not any(it.replace('&amp;', '&').startswith((f"'{n}'!", f'{n}!')) for n in drop)]
+                    new_pairs.append((label, len(kept)))
+                    new_items += kept
+                hv = ''.join(f'<vt:variant><vt:lpstr>{l}</vt:lpstr></vt:variant><vt:variant><vt:i4>{c}</vt:i4></vt:variant>' for l, c in new_pairs)
+                app = app.replace(hm.group(0), f'<HeadingPairs><vt:vector size="{2 * len(new_pairs)}" baseType="variant">{hv}</vt:vector></HeadingPairs>')
+                tv = ''.join(f'<vt:lpstr>{it}</vt:lpstr>' for it in new_items)
+                app = app.replace(tm.group(0), f'<TitlesOfParts><vt:vector size="{len(new_items)}" baseType="lpstr">{tv}</vt:vector></TitlesOfParts>')
+                parts['docProps/app.xml'] = app.encode('utf-8')
+
+    # ลบไฟล์ที่ไม่มีใครอ้างถึงแล้ว (ไล่จาก _rels/.rels)
+    reach, stack = set(), ['']
+    while stack:
+        part = stack.pop()
+        rp = _inter_rels_path(part) if part else '_rels/.rels'
+        if rp not in parts:
+            continue
+        reach.add(rp)
+        for tag in re.findall(r'<Relationship [^>]*>', parts[rp].decode('utf-8')):
+            if 'TargetMode="External"' in tag:
+                continue
+            t = re.search(r'Target="([^"]+)"', tag)
+            if not t:
+                continue
+            tgt = _inter_resolve(part if part else 'x', t.group(1)) if part else t.group(1).lstrip('/')
+            if tgt in parts and tgt not in reach:
+                reach.add(tgt)
+                stack.append(tgt)
+    removed = [p for p in list(parts) if p != '[Content_Types].xml' and p not in reach]
+    for p in removed:
+        del parts[p]
+    ct = parts['[Content_Types].xml'].decode('utf-8')
+    for p in removed:
+        ct = re.sub(rf'<Override [^>]*PartName="/{re.escape(p)}"[^>]*/>', '', ct)
+    parts['[Content_Types].xml'] = ct.encode('utf-8')
+
+
+def _inter_sheet_paths_from(wb, rels):
+    rid_target = {}
+    for tag in re.findall(r'<Relationship [^>]*>', rels):
+        rid, tgt = re.search(r'Id="([^"]+)"', tag), re.search(r'Target="([^"]+)"', tag)
+        if rid and tgt:
+            t = tgt.group(1).lstrip('/')
+            rid_target[rid.group(1)] = t if t.startswith('xl/') else 'xl/' + t
+    return [(re.search(r'name="([^"]+)"', t).group(1).replace('&amp;', '&'),
+             rid_target.get(re.search(r'r:id="([^"]+)"', t).group(1))) for t in re.findall(r'<sheet [^>]*/>', wb)]
+
+
 def inter_build_manifests(template_bytes, rows, sheet_date, deliver_text, review=None):
     """rows: DataFrame (หลังผู้ใช้เลือกชื่อไทยแล้ว) -> [(ชื่อไฟล์, bytes)]
     แผ่นละ 10 แถว ใส่ลงชีท inter 1, inter 2, ... ตามลำดับ ถ้าเกินจำนวนชีทในเทมเพลตจะต่อไฟล์ใหม่ (เทมเพลตเดิม)
-    ชีท inter ที่ไม่ได้ใช้ -> ล้างข้อมูลเก่าออก (เหลือหัวกระดาษ/ฟอร์มเปล่า) ชีทอื่น (file, Hotel, ...) ไม่แตะ"""
-    import zipfile
+    ชีท inter ที่ไม่ได้ใช้ -> ลบออกจากไฟล์ (เหลือเท่าจำนวนแผ่นที่ใช้จริง) ชีทอื่น (file, Hotel, ...) ไม่แตะ"""
+    import zipfile, copy
     zin = zipfile.ZipFile(io.BytesIO(template_bytes))
+    infos = zin.infolist()
+    orig = {i.filename: zin.read(i.filename) for i in infos}   # อ่านครั้งเดียว (writestr จะแก้ ZipInfo เดิม ทำให้อ่านซ้ำไม่ได้)
     inter_sheets = [(n, p) for n, p in _inter_sheet_paths(zin) if re.fullmatch(r'inter\s*\d+', n.strip(), re.I)]
     if not inter_sheets:
         raise ValueError('ไม่พบชีท "inter 1", "inter 2", ... ในไฟล์เทมเพลต')
@@ -3455,7 +3591,7 @@ def inter_build_manifests(template_bytes, rows, sheet_date, deliver_text, review
         file_pages = pages[f_i * per_file:(f_i + 1) * per_file]
         new_xml = {}
         for s_i, (sname, path) in enumerate(inter_sheets):
-            xml = zin.read(path).decode('utf-8')
+            xml = orig[path].decode('utf-8')
             page = file_pages[s_i] if s_i < len(file_pages) else None
             vals = {}
             if page is not None:
@@ -3480,13 +3616,19 @@ def inter_build_manifests(template_bytes, rows, sheet_date, deliver_text, review
         if f_i == 0 and review is not None and len(review):
             # แถวที่ยังไม่ได้ยืนยัน -> ชีท NeedReview ต่อท้ายไฟล์แรก (ชีทเดิมในเทมเพลตไม่แตะ)
             _inter_add_review_sheet(zin, review, new_xml, add_parts)
+        parts = dict(orig)
+        parts.update({k: v.encode('utf-8') for k, v in new_xml.items()})
+        parts.update({k: v.encode('utf-8') for k, v in add_parts.items()})
+        # ชีท inter ที่ไม่ได้ใช้ในไฟล์นี้ -> ลบทิ้ง (อย่างน้อยเหลือ inter แผ่นแรกไว้ 1 แผ่น)
+        keep_n = max(1, len(file_pages))
+        _inter_drop_sheets(parts, [n for n, _ in inter_sheets[keep_n:]])
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.infolist():
-                data = new_xml[item.filename].encode('utf-8') if item.filename in new_xml else zin.read(item.filename)
-                zout.writestr(item, data)
-            for name, data in add_parts.items():
-                zout.writestr(name, data.encode('utf-8'))
+            for item in infos:
+                if item.filename in parts:
+                    zout.writestr(copy.copy(item), parts.pop(item.filename))
+            for name, data in parts.items():
+                zout.writestr(name, data)
         files.append((f_i + 1, buf.getvalue()))
     return files, total_pages
 
