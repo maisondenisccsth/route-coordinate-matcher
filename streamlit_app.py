@@ -3443,6 +3443,16 @@ def inter_final_rows(edited, directory):
     return pd.DataFrame(out)
 
 
+def _inter_apply_edits(table, editor_state):
+    """เอาค่าที่ผู้ใช้แก้ในตาราง (st.data_editor) กลับเข้า DataFrame ต้นฉบับ — ใช้ก่อนรีเซ็ตตาราง เพื่อไม่ให้ที่เลือกไว้หาย"""
+    t = table.copy()
+    for pos, changes in ((editor_state or {}).get('edited_rows') or {}).items():
+        for col, val in changes.items():
+            if col in t.columns:
+                t.at[t.index[int(pos)], col] = val
+    return t
+
+
 def _render_inter():
     if not MASTER_SHEET_CSV_URL:
         st.error("⚠️ ยังไม่ได้ตั้งค่า MASTER_SHEET_CSV_URL — ดูวิธีตั้งค่าใน DEPLOY_INSTRUCTIONS.md")
@@ -3490,58 +3500,95 @@ def _render_inter():
     if st.session_state.get('inter_sig') != sig:
         with st.spinner("🔎 กำลังจับคู่ชื่อภาษาไทย..."):
             master_df = load_master_data(MASTER_SHEET_CSV_URL)
-            st.session_state['inter_table'] = inter_suggest(rows, master_df, directory)
+            t = inter_suggest(rows, master_df, directory)
+            # ตำแหน่งในไฟล์ Manifest (เรียงตาม OrderNo แผ่นละ 10) + ช่องยืนยัน: แถว ✅ ยืนยันให้แล้ว แถว ⚠️ ต้องติ๊กเอง
+            t['_ord'] = range(len(t))
+            t['แผ่น'] = t['_ord'] // INTER_ROWS_PER_SHEET + 1
+            t['ลำดับ'] = t['_ord'] + 1
+            t['ยืนยัน'] = t['สถานะ'] == '✅ อัตโนมัติ'
+            # แสดงแถว ⚠️ ไว้บนสุด (ตอนสร้างไฟล์จะเรียงกลับตาม OrderNo)
+            t = t.sort_values(['สถานะ', '_ord'], key=lambda s: s.eq('✅ อัตโนมัติ') if s.name == 'สถานะ' else s,
+                              kind='stable').reset_index(drop=True)
+            st.session_state['inter_table'] = t
             st.session_state['inter_sig'] = sig
+            st.session_state['inter_editor_ver'] = st.session_state.get('inter_editor_ver', 0) + 1
     table = st.session_state['inter_table']
     n_auto = int((table['สถานะ'] == '✅ อัตโนมัติ').sum())
+    n_warn = len(table) - n_auto
     n_split = int(rows['แยกแถว'].sum())
     st.markdown(f"""
     <div class="rcm-card">
         📄 InterExp {rows['OrderNo'].nunique():,} ออเดอร์ → <b>{len(rows):,} แถว</b> ({(len(rows) + 9) // 10:,} แผ่น แผ่นละ 10)
-        · จับคู่ชื่อไทยอัตโนมัติ {n_auto:,} / {len(rows):,} แถว
+        · ✅ จับคู่ชื่อไทยอัตโนมัติ {n_auto:,} แถว · ⚠️ ต้องตรวจ {n_warn:,} แถว
         {f" · มี {n_split:,} แถวที่มาจากออเดอร์ที่มีทั้งยาธรรมดาและยาเย็น (แยกเป็น 2 แถว)" if n_split else ''}
     </div>
     """, unsafe_allow_html=True)
-    st.caption("ตรวจช่อง \"เลือกชื่อไทย\" — แถว ⚠️ ระบบไม่มั่นใจ ให้เลือกเองจากรายการ (พิมพ์ค้นหาได้) ถ้าไม่เลือก จะใช้ชื่อ/ที่อยู่ภาษาอังกฤษแทน")
-    if st.button("💡 ใส่คำแนะนำในแถว ⚠️ ที่ยังไม่ได้เลือก (แล้วค่อยแก้แถวที่ผิด)", key="inter_fill_btn"):
-        t = st.session_state['inter_table']
+    st.caption("แถว ⚠️ อยู่บนสุดของตาราง — เลือกชื่อไทยให้ถูก (พิมพ์ค้นหาได้) แล้ว **ติ๊กช่อง ยืนยัน** ทุกแถว ถึงจะสร้างไฟล์ได้ "
+               "· ถ้าไม่มีชื่อไทยที่ถูก เลือก \"— ไม่เลือก —\" แล้วติ๊กยืนยัน = ใช้ชื่อ/ที่อยู่ภาษาอังกฤษ "
+               "· แผ่น/ลำดับ = ตำแหน่งในไฟล์ Manifest")
+    ed_key = f"inter_editor_{st.session_state.get('inter_editor_ver', 0)}"
+    if st.button("💡 ใส่คำแนะนำในแถว ⚠️ ที่ยังไม่ได้เลือก (ยังต้องติ๊กยืนยันเอง)", key="inter_fill_btn"):
+        t = _inter_apply_edits(st.session_state['inter_table'], st.session_state.get(ed_key))
         mask = (t['เลือกชื่อไทย'] == INTER_NONE) & (t['คำแนะนำ'] != '')
         t.loc[mask, 'เลือกชื่อไทย'] = t.loc[mask, 'คำแนะนำ']
         st.session_state['inter_table'] = t
         st.session_state['inter_editor_ver'] = st.session_state.get('inter_editor_ver', 0) + 1
+        ed_key = f"inter_editor_{st.session_state['inter_editor_ver']}"
         table = t
     options = [INTER_NONE] + sorted({_inter_label(d) for d in directory})
-    show_cols = ['สถานะ', 'OrderNo', 'ShipTo Name', 'ประเภทสินค้า', 'เลือกชื่อไทย', 'คำแนะนำ', 'คะแนน']
+    show_cols = ['ยืนยัน', 'สถานะ', 'แผ่น', 'ลำดับ', 'OrderNo', 'ShipTo Name', 'ประเภทสินค้า', 'เลือกชื่อไทย', 'คำแนะนำ', 'คะแนน']
     edited = st.data_editor(
-        table[show_cols + ['_en_addr', '_en_city', '_en_prov']],
+        table[show_cols + ['_ord', '_en_addr', '_en_city', '_en_prov']],
         column_config={
+            'ยืนยัน': st.column_config.CheckboxColumn('ยืนยัน', help="ติ๊กเมื่อตรวจแล้วว่าชื่อไทยถูก (หรือยอมใช้ภาษาอังกฤษ)", width='small'),
+            'แผ่น': st.column_config.NumberColumn('แผ่น', width='small'),
+            'ลำดับ': st.column_config.NumberColumn('ลำดับ', width='small'),
             'เลือกชื่อไทย': st.column_config.SelectboxColumn('เลือกชื่อไทย', options=options, width='large', required=True),
             'คำแนะนำ': st.column_config.TextColumn('คำแนะนำ (คะแนนสูงสุด)', width='large'),
             'คะแนน': st.column_config.NumberColumn('คะแนน', format="%.0f"),
-            '_en_addr': None, '_en_city': None, '_en_prov': None,
+            '_ord': None, '_en_addr': None, '_en_city': None, '_en_prov': None,
         },
-        disabled=['สถานะ', 'OrderNo', 'ShipTo Name', 'ประเภทสินค้า', 'คำแนะนำ', 'คะแนน'],
-        hide_index=True, use_container_width=True, key=f"inter_editor_{st.session_state.get('inter_editor_ver', 0)}",
+        disabled=['สถานะ', 'แผ่น', 'ลำดับ', 'OrderNo', 'ShipTo Name', 'ประเภทสินค้า', 'คำแนะนำ', 'คะแนน'],
+        hide_index=True, use_container_width=True, key=ed_key,
+        height=(min(len(table), 15) + 1) * 35 + 3,
     )
-    if st.button("🚀 สร้างไฟล์ Manifest", type="primary", use_container_width=True, key="inter_btn"):
+    pending = edited[~edited['ยืนยัน'].astype(bool)]
+    if len(pending):
+        st.warning(f"⚠️ ยังไม่ได้ยืนยัน {len(pending):,} แถว — ติ๊กช่อง \"ยืนยัน\" ให้ครบก่อน ถึงจะสร้างไฟล์ได้")
+    # ลายเซ็นของสิ่งที่เลือก: ถ้าแก้ตาราง/วันที่หลังสร้างไฟล์ ต้องกดสร้างใหม่ (กันโหลดไฟล์เก่า)
+    edit_sig = (sig, tuple(edited.sort_values('_ord')['เลือกชื่อไทย']),
+                sheet_date.strftime('%d/%m/%Y'), deliver_date.strftime('%d/%m/%Y'))
+    if st.button("🚀 สร้างไฟล์ Manifest", type="primary", use_container_width=True, key="inter_btn",
+                 disabled=len(pending) > 0):
         try:
-            final = inter_final_rows(edited, directory)
+            final = inter_final_rows(edited.sort_values('_ord'), directory)
             files, pages = inter_build_manifests(
                 tpl_bytes, final, sheet_date.strftime('%d/%m/%Y'),
                 f"ส่งถึง {deliver_date.strftime('%d/%m/%y')} ก่อน 12.00 น.")
+            checked = edited[edited['สถานะ'] != '✅ อัตโนมัติ'].sort_values('_ord')
             st.session_state['inter_files'] = files
-            st.session_state['inter_result'] = {'rows': len(final), 'pages': pages,
-                                                'english': int((~final['_thai']).sum()), 'sig': sig}
+            st.session_state['inter_result'] = {
+                'rows': len(final), 'pages': pages, 'english': int((~final['_thai']).sum()), 'sig': edit_sig,
+                'checked': checked[['แผ่น', 'ลำดับ', 'OrderNo', 'ShipTo Name', 'เลือกชื่อไทย']].rename(
+                    columns={'เลือกชื่อไทย': 'ชื่อที่ใช้ในใบ'}).replace({INTER_NONE: '(ภาษาอังกฤษ)'})}
         except Exception as e:
             st.error(f"เกิดข้อผิดพลาด: {e}")
             st.exception(e)
     res = st.session_state.get('inter_result')
-    if not res or res.get('sig') != sig:
+    if not res or res.get('sig', (None,))[0] != sig:
+        return
+    if len(pending):
+        return
+    if res['sig'] != edit_sig:
+        st.info("✏️ ตาราง/วันที่ถูกแก้หลังสร้างไฟล์ — กด \"สร้างไฟล์ Manifest\" ใหม่อีกครั้ง แล้วค่อยดาวน์โหลด")
         return
     msg = f"🎯 <b>เสร็จแล้ว!</b> {res['rows']:,} แถว · {res['pages']:,} แผ่น"
     if res['english']:
-        msg += f" · ⚠️ {res['english']:,} แถวยังเป็นภาษาอังกฤษ (ไม่ได้เลือกชื่อไทย)"
+        msg += f" · {res['english']:,} แถวใช้ภาษาอังกฤษ (ยืนยันแล้ว)"
     st.markdown(f'<div class="rcm-card rcm-card-success">{msg}</div>', unsafe_allow_html=True)
+    if len(res['checked']):
+        with st.expander(f"📋 แถว ⚠️ ที่ตรวจ/ยืนยันเอง {len(res['checked']):,} แถว — อยู่แผ่น/ลำดับไหนในไฟล์"):
+            st.dataframe(res['checked'], hide_index=True, use_container_width=True)
     files = st.session_state['inter_files']
     base = tpl_file.name.rsplit('.', 1)[0]
     stamp = sheet_date.strftime('%d.%m.%y')
