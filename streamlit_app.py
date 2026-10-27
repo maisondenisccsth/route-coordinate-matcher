@@ -3336,7 +3336,8 @@ def inter_suggest(rows, master_df, directory):
 
 # ---------- เขียนค่าลงเทมเพลตแบบแก้ XML ตรง ๆ (ไม่เปิด/บันทึกด้วย openpyxl เพราะจะทำให้รูป, checkbox, OLE หาย) ----------
 def _inter_xml_escape(s):
-    return (str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;'))
+    s = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', str(s))
+    return (s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;'))
 
 
 def _inter_set_cells(xml, values):
@@ -3379,7 +3380,63 @@ def _inter_sheet_paths(zf):
     return out
 
 
-def inter_build_manifests(template_bytes, rows, sheet_date, deliver_text):
+INTER_REVIEW_SHEET = 'NeedReview'
+INTER_REVIEW_COLS = [('ลำดับ', 7), ('OrderNo', 11), ('ShipTo Name (อังกฤษ)', 42), ('ประเภทสินค้า', 12), ('สถานะ', 13),
+                     ('ชื่อไทยที่เลือกไว้', 60), ('คำแนะนำ (คะแนนสูงสุด)', 60), ('คะแนน', 8),
+                     ('ที่อยู่ (อังกฤษ)', 45), ('City', 18), ('Province', 18)]
+
+
+def _inter_review_sheet_xml(review):
+    """DataFrame แถวที่ต้องตรวจ -> xml ของชีทใหม่ (ข้อความธรรมดา ไม่ใช้สไตล์ของเทมเพลต)"""
+    def cell(ref, v):
+        if v is None or (isinstance(v, float) and pd.isna(v)) or v == '':
+            return ''
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return f'<c r="{ref}"><v>{v}</v></c>'
+        return f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{_inter_xml_escape(v)}</t></is></c>'
+    letters = [chr(65 + i) for i in range(len(INTER_REVIEW_COLS))]
+    rows_xml = ['<row r="1">' + ''.join(cell(f'{c}1', h) for c, (h, _) in zip(letters, INTER_REVIEW_COLS)) + '</row>']
+    for i, rec in enumerate(review.to_dict('records'), start=2):
+        vals = [rec.get(h) for h, _ in INTER_REVIEW_COLS]
+        rows_xml.append(f'<row r="{i}">' + ''.join(cell(f'{c}{i}', v) for c, v in zip(letters, vals)) + '</row>')
+    cols = ''.join(f'<col min="{k}" max="{k}" width="{w}" customWidth="1"/>' for k, (_, w) in enumerate(INTER_REVIEW_COLS, 1))
+    last = f'{letters[-1]}{len(review) + 1}'
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f'<dimension ref="A1:{last}"/>'
+            '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+            '</sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/>'
+            f'<cols>{cols}</cols><sheetData>{"".join(rows_xml)}</sheetData>'
+            f'<autoFilter ref="A1:{last}"/>'
+            '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></worksheet>')
+
+
+def _inter_add_review_sheet(zin, review, new_xml, add_parts):
+    """เพิ่มชีท NeedReview ต่อท้ายสุดของไฟล์ (ถ้าเทมเพลตมีชีทชื่อนี้อยู่แล้ว เขียนทับเนื้อหาชีทนั้นแทน)"""
+    sheet_xml = _inter_review_sheet_xml(review)
+    existing = dict(_inter_sheet_paths(zin))
+    if INTER_REVIEW_SHEET in existing and existing[INTER_REVIEW_SHEET]:
+        new_xml[existing[INTER_REVIEW_SHEET]] = sheet_xml
+        return
+    names = set(zin.namelist())
+    n = 1
+    while f'xl/worksheets/sheet{n}.xml' in names:
+        n += 1
+    part = f'xl/worksheets/sheet{n}.xml'
+    wb = zin.read('xl/workbook.xml').decode('utf-8')
+    rels = zin.read('xl/_rels/workbook.xml.rels').decode('utf-8')
+    ct = zin.read('[Content_Types].xml').decode('utf-8')
+    rid = 'rId' + str(max([int(x) for x in re.findall(r'Id="rId(\d+)"', rels)] or [0]) + 1)
+    sid = max([int(x) for x in re.findall(r'sheetId="(\d+)"', wb)] or [0]) + 1
+    wb = wb.replace('</sheets>', f'<sheet name="{INTER_REVIEW_SHEET}" sheetId="{sid}" r:id="{rid}"/></sheets>', 1)
+    rels = rels.replace('</Relationships>', f'<Relationship Id="{rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{n}.xml"/></Relationships>', 1)
+    ct = ct.replace('</Types>', f'<Override PartName="/{part}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>', 1)
+    new_xml['xl/workbook.xml'], new_xml['xl/_rels/workbook.xml.rels'], new_xml['[Content_Types].xml'] = wb, rels, ct
+    add_parts[part] = sheet_xml
+
+
+def inter_build_manifests(template_bytes, rows, sheet_date, deliver_text, review=None):
     """rows: DataFrame (หลังผู้ใช้เลือกชื่อไทยแล้ว) -> [(ชื่อไฟล์, bytes)]
     แผ่นละ 10 แถว ใส่ลงชีท inter 1, inter 2, ... ตามลำดับ ถ้าเกินจำนวนชีทในเทมเพลตจะต่อไฟล์ใหม่ (เทมเพลตเดิม)
     ชีท inter ที่ไม่ได้ใช้ -> ล้างข้อมูลเก่าออก (เหลือหัวกระดาษ/ฟอร์มเปล่า) ชีทอื่น (file, Hotel, ...) ไม่แตะ"""
@@ -3389,9 +3446,9 @@ def inter_build_manifests(template_bytes, rows, sheet_date, deliver_text):
     if not inter_sheets:
         raise ValueError('ไม่พบชีท "inter 1", "inter 2", ... ในไฟล์เทมเพลต')
     recs = rows.to_dict('records')
-    pages = [recs[i:i + INTER_ROWS_PER_SHEET] for i in range(0, len(recs), INTER_ROWS_PER_SHEET)] or [[]]
+    pages = [recs[i:i + INTER_ROWS_PER_SHEET] for i in range(0, len(recs), INTER_ROWS_PER_SHEET)]
     per_file = len(inter_sheets)
-    n_files = (len(pages) + per_file - 1) // per_file
+    n_files = max(1, (len(pages) + per_file - 1) // per_file)
     total_pages = len(pages)
     files = []
     for f_i in range(n_files):
@@ -3419,11 +3476,17 @@ def inter_build_manifests(template_bytes, rows, sheet_date, deliver_text):
                     f'K{r}': None, f'L{r}': None, f'M{r}': None, f'N{r}': None, f'O{r}': deliver_text,
                 })
             new_xml[path] = _inter_set_cells(xml, vals)
+        add_parts = {}
+        if f_i == 0 and review is not None and len(review):
+            # แถวที่ยังไม่ได้ยืนยัน -> ชีท NeedReview ต่อท้ายไฟล์แรก (ชีทเดิมในเทมเพลตไม่แตะ)
+            _inter_add_review_sheet(zin, review, new_xml, add_parts)
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
                 data = new_xml[item.filename].encode('utf-8') if item.filename in new_xml else zin.read(item.filename)
                 zout.writestr(item, data)
+            for name, data in add_parts.items():
+                zout.writestr(name, data.encode('utf-8'))
         files.append((f_i + 1, buf.getvalue()))
     return files, total_pages
 
@@ -3523,7 +3586,7 @@ def _render_inter():
         {f" · มี {n_split:,} แถวที่มาจากออเดอร์ที่มีทั้งยาธรรมดาและยาเย็น (แยกเป็น 2 แถว)" if n_split else ''}
     </div>
     """, unsafe_allow_html=True)
-    st.caption("แถว ⚠️ อยู่บนสุดของตาราง — เลือกชื่อไทยให้ถูก (พิมพ์ค้นหาได้) แล้ว **ติ๊กช่อง ยืนยัน** ทุกแถว ถึงจะสร้างไฟล์ได้ "
+    st.caption("แถว ⚠️ อยู่บนสุดของตาราง — เลือกชื่อไทยให้ถูก (พิมพ์ค้นหาได้) แล้ว **ติ๊กช่อง ยืนยัน** แถวที่ไม่ได้ติ๊กจะไม่ลงใบ Manifest แต่ไปอยู่ชีท NeedReview "
                "· ถ้าไม่มีชื่อไทยที่ถูก เลือก \"— ไม่เลือก —\" แล้วติ๊กยืนยัน = ใช้ชื่อ/ที่อยู่ภาษาอังกฤษ "
                "· แผ่น/ลำดับ = ตำแหน่งในไฟล์ Manifest")
     ed_key = f"inter_editor_{st.session_state.get('inter_editor_ver', 0)}"
@@ -3554,21 +3617,29 @@ def _render_inter():
     )
     pending = edited[~edited['ยืนยัน'].astype(bool)]
     if len(pending):
-        st.warning(f"⚠️ ยังไม่ได้ยืนยัน {len(pending):,} แถว — ติ๊กช่อง \"ยืนยัน\" ให้ครบก่อน ถึงจะสร้างไฟล์ได้")
+        st.warning(f"⚠️ ยังไม่ได้ยืนยัน {len(pending):,} แถว — สร้างไฟล์ได้ แต่แถวที่ไม่ได้ติ๊กจะ**ไม่ลงใบ Manifest** "
+                   f"จะแยกไปอยู่ชีท {INTER_REVIEW_SHEET} ท้ายไฟล์แทน")
     # ลายเซ็นของสิ่งที่เลือก: ถ้าแก้ตาราง/วันที่หลังสร้างไฟล์ ต้องกดสร้างใหม่ (กันโหลดไฟล์เก่า)
-    edit_sig = (sig, tuple(edited.sort_values('_ord')['เลือกชื่อไทย']),
+    edit_sig = (sig, tuple(edited.sort_values('_ord')['เลือกชื่อไทย']), tuple(edited.sort_values('_ord')['ยืนยัน'].astype(bool)),
                 sheet_date.strftime('%d/%m/%Y'), deliver_date.strftime('%d/%m/%Y'))
-    if st.button("🚀 สร้างไฟล์ Manifest", type="primary", use_container_width=True, key="inter_btn",
-                 disabled=len(pending) > 0):
+    if st.button("🚀 สร้างไฟล์ Manifest", type="primary", use_container_width=True, key="inter_btn"):
         try:
-            final = inter_final_rows(edited.sort_values('_ord'), directory)
+            ok_mask = edited['ยืนยัน'].astype(bool)
+            final = inter_final_rows(edited[ok_mask].sort_values('_ord'), directory)
+            review = edited[~ok_mask].sort_values('_ord').copy()
+            review['ลำดับ'] = range(1, len(review) + 1)
+            review['ShipTo Name (อังกฤษ)'] = review['ShipTo Name']
+            review['ชื่อไทยที่เลือกไว้'] = review['เลือกชื่อไทย'].replace({INTER_NONE: ''})
+            review['คำแนะนำ (คะแนนสูงสุด)'] = review['คำแนะนำ']
+            review['ที่อยู่ (อังกฤษ)'], review['City'], review['Province'] = review['_en_addr'], review['_en_city'], review['_en_prov']
             files, pages = inter_build_manifests(
                 tpl_bytes, final, sheet_date.strftime('%d/%m/%Y'),
-                f"ส่งถึง {deliver_date.strftime('%d/%m/%y')} ก่อน 12.00 น.")
-            checked = edited[edited['สถานะ'] != '✅ อัตโนมัติ'].sort_values('_ord')
+                f"ส่งถึง {deliver_date.strftime('%d/%m/%y')} ก่อน 12.00 น.", review=review)
+            checked = edited[ok_mask & (edited['สถานะ'] != '✅ อัตโนมัติ')].sort_values('_ord')
             st.session_state['inter_files'] = files
             st.session_state['inter_result'] = {
-                'rows': len(final), 'pages': pages, 'english': int((~final['_thai']).sum()), 'sig': edit_sig,
+                'rows': len(final), 'pages': pages, 'english': int((~final['_thai']).sum()) if len(final) else 0,
+                'review': len(review), 'sig': edit_sig,
                 'checked': checked[['แผ่น', 'ลำดับ', 'OrderNo', 'ShipTo Name', 'เลือกชื่อไทย']].rename(
                     columns={'เลือกชื่อไทย': 'ชื่อที่ใช้ในใบ'}).replace({INTER_NONE: '(ภาษาอังกฤษ)'})}
         except Exception as e:
@@ -3577,14 +3648,14 @@ def _render_inter():
     res = st.session_state.get('inter_result')
     if not res or res.get('sig', (None,))[0] != sig:
         return
-    if len(pending):
-        return
     if res['sig'] != edit_sig:
         st.info("✏️ ตาราง/วันที่ถูกแก้หลังสร้างไฟล์ — กด \"สร้างไฟล์ Manifest\" ใหม่อีกครั้ง แล้วค่อยดาวน์โหลด")
         return
-    msg = f"🎯 <b>เสร็จแล้ว!</b> {res['rows']:,} แถว · {res['pages']:,} แผ่น"
+    msg = f"🎯 <b>เสร็จแล้ว!</b> ลงใบ Manifest {res['rows']:,} แถว · {res['pages']:,} แผ่น"
     if res['english']:
         msg += f" · {res['english']:,} แถวใช้ภาษาอังกฤษ (ยืนยันแล้ว)"
+    if res['review']:
+        msg += f" · ⚠️ ไม่ได้ยืนยัน {res['review']:,} แถว → อยู่ชีท {INTER_REVIEW_SHEET} (ยังไม่ลงใบ)"
     st.markdown(f'<div class="rcm-card rcm-card-success">{msg}</div>', unsafe_allow_html=True)
     if len(res['checked']):
         with st.expander(f"📋 แถว ⚠️ ที่ตรวจ/ยืนยันเอง {len(res['checked']):,} แถว — อยู่แผ่น/ลำดับไหนในไฟล์"):
