@@ -1967,7 +1967,7 @@ def read_bkk_orders(file_bytes):
     c_type = col('cust type', 'customer type')
     c_cname = col('cust name', 'cust. name', 'customer name')
     c_sname = col('shipto name', 'ship to name', 'ship-to name')
-    c_addr = col('shipto.address', prefix='shipto.addr')   # 'ShipTo.Address2' / 'ShipTo.Addre' (หัวคอลัมน์ถูกตัด)
+    c_addr = col('shipto.address', prefix='shipto.ad')   # 'ShipTo.Address2' / 'ShipTo.Addre' / 'ShipTo.Ad' (หัวคอลัมน์ถูกตัด)
     if c_addr is None:
         c_addr = col('shipto.c')
     c_route = col('route')
@@ -2030,7 +2030,8 @@ def _bkk_route_sort_key(route):
     """Route ตัวเลขมาก่อนเรียงตามค่า (1, 2, 3, 11, 12) แล้วตามด้วย Route ที่เป็นตัวหนังสือ"""
     if isinstance(route, (int, float)) and not pd.isna(route):
         return (0, float(route), '')
-    return (1, 0.0, '' if route is None else str(route))
+    text = '' if route is None else str(route)
+    return (1, 0.0, re.sub(r'\d+', lambda m: m.group(0).zfill(6), text))   # PKT2 มาก่อน PKT10
 
 
 BKK_CARRIER_SHEET = 'InterExp-B&W'
@@ -2038,10 +2039,14 @@ BKK_CARRIER_SHEET = 'InterExp-B&W'
 BKK_RETAIL_CARRIER_SHEET = 'Retail + InterExp-B&W'
 
 
-def bkk_output_sheets(normal_df, retail_df, carrier_df, notype_df=None):
-    """ชีทที่อยู่ในไฟล์ใบงาน: Order / Retail + InterExp-B&W / (No Cust Type ถ้ามี)"""
-    sheets = [('Order', normal_df),
-              (BKK_RETAIL_CARRIER_SHEET, pd.concat([retail_df, carrier_df], ignore_index=True))]
+def bkk_output_sheets(normal_df, retail_df, carrier_df, notype_df=None, merged=False):
+    """ชีทที่อยู่ในไฟล์ใบงาน: Order / Retail + InterExp-B&W / (No Cust Type ถ้ามี)
+    merged=True (PKT / SAMUI): ไม่มีชีท Retail + InterExp-B&W — ทุกออเดอร์อยู่ชีท Order ชีทเดียว"""
+    if merged:
+        sheets = [('Order', pd.concat([normal_df, retail_df, carrier_df], ignore_index=True))]
+    else:
+        sheets = [('Order', normal_df),
+                  (BKK_RETAIL_CARRIER_SHEET, pd.concat([retail_df, carrier_df], ignore_index=True))]
     if notype_df is not None and len(notype_df):
         sheets.append((BKK_NOTYPE_SHEET, notype_df))
     return sheets
@@ -2262,7 +2267,7 @@ def bkk_missing_codes_to_excel_bytes(df):
 
 
 def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service_minutes=15, retail_service_minutes=45,
-                       product_df=None):
+                       product_df=None, merged=False):
     """แยก Retail / ไม่ใช่ Retail + เติม Lat/Lon (จับด้วย ShipTo Name แบบเดียวกับแท็บประมวลผลไฟล์)
     Retail ดูจาก Channel ใน Master (คอลัมน์ C) ตาม ShipTo Name; ถ้าไม่เจอชื่อใน Master เลย
     ใช้ Cust Type ในไฟล์แทน (R = Retail) แล้วนับไว้รายงาน
@@ -2270,6 +2275,8 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service
       1) Route เป็น InterExp / IE,B&W -> ชีท InterExp-B&W เสมอ (ไม่ว่าจะเป็น Retail หรือไม่)
       2) ช่อง Cust Type ในไฟล์ว่าง -> ชีท No Cust Type (เก็บไว้ให้คนตรวจ ไม่เดาว่าเป็นประเภทไหน)
       3) ที่เหลือแบ่ง Retail / ไม่ใช่ Retail
+    merged=True (PKT / SAMUI): ไม่แยก Retail / InterExp ออกชีท — ทุกออเดอร์ (ยกเว้น Cust Type ว่าง) อยู่ใน normal_df
+      ตามลำดับ Route เดียวกัน แต่ Service Time ยังใช้เวลา Retail กับออเดอร์ที่เป็น Retail
     Returns (normal_df, retail_df, carrier_df, notype_df, info)"""
     df = orders.copy()
     if dates is not None:
@@ -2331,9 +2338,11 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service
     df['_rk'] = df['Route'].map(_bkk_route_sort_key)
     df['_ck'] = df['Customer Name'].map(lambda v: '' if v is None else str(v))
     df['_ok'] = df['OrderNo'].map(lambda v: (0, v, '') if isinstance(v, int) else (1, 0, str(v)))
-    df = df.sort_values(['_rk', '_ck', '_ok'], kind='stable')
+    # PKT / SAMUI (ชีทเดียว): Route InterExp / IE,B&W ไว้ท้ายชีท
+    df['_cr'] = df['Route'].map(_bkk_is_carrier_route) if merged else False
+    df = df.sort_values(['_cr', '_rk', '_ck', '_ok'], kind='stable')
 
-    df['_carrier'] = df['Route'].map(_bkk_is_carrier_route)
+    df['_carrier'] = df['Route'].map(_bkk_is_carrier_route) if not merged else False
     df['_notype'] = df['Cust Type'].map(_cell_blank) & ~df['_carrier']
     rest = ~df['_carrier'] & ~df['_notype']
     # Service Time: เวลามาตรฐานต่อร้าน (Retail 45 นาที / อื่นๆ 15 นาที) หารด้วยจำนวน SO ที่
@@ -2346,8 +2355,12 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service
         key = bucket + '|' + ship
         standard = df['_retail'].map({True: float(retail_service_minutes), False: float(service_minutes)})
         df[BKK_SERVICE_COL] = (standard / key.map(key.value_counts())).round(2)
-    normal = df[rest & ~df['_retail']][BKK_COLUMNS].reset_index(drop=True)
-    retail = df[rest & df['_retail']][BKK_COLUMNS].reset_index(drop=True)
+    if merged:
+        normal = df[rest][BKK_COLUMNS].reset_index(drop=True)
+        retail = df.iloc[0:0][BKK_COLUMNS].reset_index(drop=True)
+    else:
+        normal = df[rest & ~df['_retail']][BKK_COLUMNS].reset_index(drop=True)
+        retail = df[rest & df['_retail']][BKK_COLUMNS].reset_index(drop=True)
     carrier = df[df['_carrier']][BKK_COLUMNS].reset_index(drop=True)
     notype = df[df['_notype']][BKK_COLUMNS].reset_index(drop=True)
     # คอลัมน์ Route ในไฟล์ผลลัพธ์ = Route จากคอลัมน์ A ของ Sheet1 (ออเดอร์ที่มีหลาย Route ใช้ Route แรกที่เจอ)
@@ -2360,7 +2373,9 @@ def process_bkk_orders(orders, info, master_df, channel_map, dates=None, service
         'retail_by_cust_type': by_cust_type, 'forced_fs': forced_fs, 'service_minutes': service_minutes, 'retail_service_minutes': retail_service_minutes,
         'coords_normal': int(normal['Latitude'].notna().sum()), 'coords_retail': int(retail['Latitude'].notna().sum()),
         'coords_carrier': int(carrier['Latitude'].notna().sum()),
-        'weighed_lines': weighed,
+        'weighed_lines': weighed, 'merged': merged,
+        'retail_in_order': int((rest & df['_retail']).sum()),
+        'carrier_in_order': int((rest & df['Route'].map(_bkk_is_carrier_route)).sum()) if merged else 0,
     })
     out_info.pop('lines_df', None)
     return normal, retail, carrier, notype, out_info
@@ -2434,7 +2449,7 @@ def _bkk_write_summary_sheets(wb, summary):
         ws.column_dimensions[get_column_letter(c)].width = wd
 
 
-def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_df=None, summary=None):
+def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_df=None, summary=None, merged=False):
     """ชีท Order / Retail + InterExp-B&W (+ No Cust Type ถ้ามีออเดอร์ที่ช่อง Cust Type ว่าง)
     หน้าตาเดียวกับใบงาน Sheet2: หัวกระดาษ ทะเบียนรถ/วันที่/เลขไมล์,
     หัวตารางแถว 4, ฟอนต์ Cordia New, เส้นขอบทุกช่อง + Lat/Lon ต่อท้าย"""
@@ -2468,7 +2483,7 @@ def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_
             width = max((len(str(v)) for v in sheet1_df[col] if not _cell_blank(v)), default=6)
             ws1.column_dimensions[get_column_letter(c_i)].width = min(max(width + 2, 8), 50)
 
-    sheets = bkk_output_sheets(normal_df, retail_df, carrier_df, notype_df)
+    sheets = bkk_output_sheets(normal_df, retail_df, carrier_df, notype_df, merged=merged)
     for title, df in sheets:
         ws = wb.create_sheet(title=title)
         ws['B1'] = 'ทะเบียนรถ____________________'
@@ -2537,13 +2552,23 @@ def bkk_to_excel_bytes(normal_df, retail_df, carrier_df, notype_df=None, sheet1_
     return buf.getvalue()
 
 
-def _render_bkk():
+# แท็บทำใบงานจาก Sheet1 ใช้ร่วมกันทุกพื้นที่ (BKK / PKT / SAMUI) — PKT, SAMUI รวมทุกออเดอร์ไว้ชีท Order ชีทเดียว
+SHEET1_REGIONS = {
+    'BKK': {'key': 'bkk', 'name': 'BKK', 'icon': '🏙️', 'merged': False, 'fs': 20.0, 'retail': 45.0},
+    'PKT': {'key': 'pkt1', 'name': 'PKT', 'icon': '🏝️', 'merged': True, 'fs': 20.0, 'retail': 45.0},
+    'SAMUI': {'key': 'smu1', 'name': 'SAMUI', 'icon': '🌴', 'merged': True, 'fs': 20.0, 'retail': 45.0},
+}
+
+
+def _render_sheet1(region):
+    cfg = SHEET1_REGIONS[region]
+    K, NAME, merged = cfg['key'], cfg['name'], cfg['merged']
     if not MASTER_SHEET_CSV_URL:
         st.error("⚠️ ยังไม่ได้ตั้งค่า MASTER_SHEET_CSV_URL — ดูวิธีตั้งค่าใน DEPLOY_INSTRUCTIONS.md")
         return
-    st.markdown("##### 🏙️ For BKK — ทำใบงานจาก Sheet1")
+    st.markdown(f"##### {cfg['icon']} For {NAME} — ทำใบงานจาก Sheet1")
 
-    bkk_file = st.file_uploader("อัพโหลดไฟล์ route", type=['xls', 'xlsx'], label_visibility="collapsed", key="bkk_uploader")
+    bkk_file = st.file_uploader("อัพโหลดไฟล์ route", type=['xls', 'xlsx'], label_visibility="collapsed", key=f"{K}_uploader")
 
     if bkk_file is not None:
         bkk_bytes = bkk_file.read()
@@ -2563,7 +2588,7 @@ def _render_bkk():
         if len(bkk_dates) > 1:
             bkk_sel_dates = st.multiselect(
                 "Order Date ที่จะเอา (ค่าเริ่มต้น = ทุกวันที่มีใน Sheet1)",
-                options=bkk_dates, default=bkk_dates, key="bkk_dates",
+                options=bkk_dates, default=bkk_dates, key=f"{K}_dates",
             )
         else:
             bkk_sel_dates = bkk_dates
@@ -2575,10 +2600,10 @@ def _render_bkk():
         st.caption("⏱️ เวลาบริการมาตรฐานต่อร้าน (นาที) — หารเท่า ๆ กันตามจำนวน SO ที่ ShipTo Name เดียวกัน")
         svc_c1, svc_c2 = st.columns(2)
         with svc_c1:
-            bkk_service = st.number_input("Food Service", min_value=1.0, max_value=240.0, value=15.0, step=1.0, key="bkk_service_min")
+            bkk_service = st.number_input("Food Service", min_value=1.0, max_value=240.0, value=cfg['fs'], step=1.0, key=f"{K}_service_min")
         with svc_c2:
-            bkk_service_retail = st.number_input("Retail", min_value=1.0, max_value=240.0, value=45.0, step=1.0, key="bkk_service_min_retail")
-        bkk_clicked = st.button("🚀 ทำใบงาน For BKK", type="primary", use_container_width=True, key="bkk_btn")
+            bkk_service_retail = st.number_input("Retail", min_value=1.0, max_value=240.0, value=cfg['retail'], step=1.0, key=f"{K}_service_min_retail")
+        bkk_clicked = st.button(f"🚀 ทำใบงาน For {NAME}", type="primary", use_container_width=True, key=f"{K}_btn")
 
         if bkk_clicked:
             with st.spinner("🛰️ กำลังแยก Retail เติมพิกัด และคิดน้ำหนัก..."):
@@ -2598,48 +2623,65 @@ def _render_bkk():
                         dates=bkk_sel_dates if len(bkk_dates) > 1 else None,
                         service_minutes=float(bkk_service),
                         retail_service_minutes=float(bkk_service_retail),
-                        product_df=bkk_product,
+                        product_df=bkk_product, merged=merged,
                     )
-                    bkk_sheets = bkk_output_sheets(bkk_normal, bkk_retail, bkk_carrier, bkk_notype)
+                    bkk_sheets = bkk_output_sheets(bkk_normal, bkk_retail, bkk_carrier, bkk_notype, merged=merged)
                     bkk_summary = bkk_summaries(bkk_sheets, bkk_result['weighed_lines'])
-                    st.session_state['bkk_xlsx'] = bkk_to_excel_bytes(bkk_normal, bkk_retail, bkk_carrier, bkk_notype,
+                    st.session_state[f'{K}_xlsx'] = bkk_to_excel_bytes(bkk_normal, bkk_retail, bkk_carrier, bkk_notype,
                                                                       sheet1_df=bkk_sheet1_clean(bkk_bytes),
-                                                                      summary=bkk_summary)
-                    st.session_state['bkk_summary'] = bkk_summary
-                    st.session_state['bkk_product_err'] = bkk_product_err
-                    st.session_state['bkk_result'] = bkk_result
-                    st.session_state['bkk_filename'] = bkk_file.name
+                                                                      summary=bkk_summary, merged=merged)
+                    st.session_state[f'{K}_summary'] = bkk_summary
+                    st.session_state[f'{K}_product_err'] = bkk_product_err
+                    st.session_state[f'{K}_result'] = bkk_result
+                    st.session_state[f'{K}_filename'] = bkk_file.name
                 except Exception as e:
                     st.error(f"เกิดข้อผิดพลาด: {e}")
                     st.exception(e)
 
-        if 'bkk_result' in st.session_state and st.session_state.get('bkk_filename') == bkk_file.name:
-            res = st.session_state['bkk_result']
-            st.markdown(f"""
-            <div class="rcm-card rcm-card-success">
-                🎯 <b>เสร็จแล้ว!</b> {res['selected_orders']:,} ออเดอร์ → Order {res['normal']:,} + Retail {res['retail']:,} + InterExp/B&W {res['carrier']:,} + ไม่มี Cust Type {res['notype']:,}
-            </div>
-            """, unsafe_allow_html=True)
+        if f'{K}_result' in st.session_state and st.session_state.get(f'{K}_filename') == bkk_file.name:
+            res = st.session_state[f'{K}_result']
+            if merged:
+                st.markdown(f"""
+                <div class="rcm-card rcm-card-success">
+                    🎯 <b>เสร็จแล้ว!</b> {res['selected_orders']:,} ออเดอร์ → Order {res['normal']:,} (ในนั้นเป็น Retail {res['retail_in_order']:,}) + ไม่มี Cust Type {res['notype']:,}
+                </div>
+                """, unsafe_allow_html=True)
+                mc1, mc2 = st.columns(2)
+                with mc1:
+                    stat_box("SHEET: Order", f"{res['normal']:,}",
+                             f"มีพิกัด {res['coords_normal']:,} / {res['normal']:,} · Retail {res['retail_in_order']:,} (Service {res['retail_service_minutes']:g} นาที)")
+                with mc2:
+                    stat_box("SHEET: No Cust Type", f"{res['notype']:,}",
+                             f"มีพิกัด {res['coords_notype']:,} / {res['notype']:,}" if res['notype'] else "ไม่มี — ไม่สร้างชีทนี้")
+            else:
+                st.markdown(f"""
+                <div class="rcm-card rcm-card-success">
+                    🎯 <b>เสร็จแล้ว!</b> {res['selected_orders']:,} ออเดอร์ → Order {res['normal']:,} + Retail {res['retail']:,} + InterExp/B&W {res['carrier']:,} + ไม่มี Cust Type {res['notype']:,}
+                </div>
+                """, unsafe_allow_html=True)
 
-            bc1, bc2, bc4 = st.columns(3)
+            bc1, bc2, bc4 = st.columns(3) if not merged else (None, None, None)
             rc_total = res['retail'] + res['carrier']
-            with bc1:
-                stat_box("SHEET: Order", f"{res['normal']:,}",
-                          f"มีพิกัด {res['coords_normal']:,} / {res['normal']:,}")
-            with bc2:
-                stat_box(f"SHEET: {BKK_RETAIL_CARRIER_SHEET}", f"{rc_total:,}",
-                          f"Retail {res['retail']:,} · InterExp-B&W {res['carrier']:,} · "
-                          f"มีพิกัด {res['coords_retail'] + res['coords_carrier']:,} / {rc_total:,}")
-            with bc4:
-                stat_box("SHEET: No Cust Type", f"{res['notype']:,}",
-                          f"มีพิกัด {res['coords_notype']:,} / {res['notype']:,}" if res['notype'] else "ไม่มี — ไม่สร้างชีทนี้")
+            if not merged:
+                with bc1:
+                    stat_box("SHEET: Order", f"{res['normal']:,}",
+                             f"มีพิกัด {res['coords_normal']:,} / {res['normal']:,}")
+                with bc2:
+                    stat_box(f"SHEET: {BKK_RETAIL_CARRIER_SHEET}", f"{rc_total:,}",
+                             f"Retail {res['retail']:,} · InterExp-B&W {res['carrier']:,} · "
+                             f"มีพิกัด {res['coords_retail'] + res['coords_carrier']:,} / {rc_total:,}")
+                with bc4:
+                    stat_box("SHEET: No Cust Type", f"{res['notype']:,}",
+                             f"มีพิกัด {res['coords_notype']:,} / {res['notype']:,}" if res['notype'] else "ไม่มี — ไม่สร้างชีทนี้")
 
             bkk_notes = []
             if res['retail_by_cust_type']:
                 bkk_notes.append(f"{res['retail_by_cust_type']:,} ออเดอร์ไม่เจอ ShipTo Name ใน Master — แยก Retail จาก Cust Type ในไฟล์แทน (R = Retail)")
             if res['notype']:
                 bkk_notes.append(f"{res['notype']:,} ออเดอร์ช่อง Cust Type ว่าง — แยกไว้ในชีท {BKK_NOTYPE_SHEET} ให้ตรวจเอง (ไม่ได้ลบ และไม่ได้เดาประเภท)")
-            if res.get('carrier_notype'):
+            if merged and res.get('carrier_in_order'):
+                bkk_notes.append(f"{res['carrier_in_order']:,} ออเดอร์เป็น Route InterExp / IE,B&W — อยู่ในชีท Order ด้วย (ไม่ได้แยกชีท)")
+            if not merged and res.get('carrier_notype'):
                 bkk_notes.append(f"{res['carrier_notype']:,} ออเดอร์ InterExp-B&W (ชีท {BKK_RETAIL_CARRIER_SHEET}) ช่อง Cust Type ว่าง (อยู่ชีทนั้นตาม Route)")
             if res.get('forced_fs'):
                 bkk_notes.append(f"{res['forced_fs']:,} ออเดอร์ของ {', '.join(BKK_FORCE_FOOD_SERVICE)} ถูกเปลี่ยนเป็น F (Food Service) ตามที่ตั้งไว้")
@@ -2652,7 +2694,7 @@ def _render_bkk():
                 st.markdown('<div class="rcm-card rcm-card-warn">⚠️ <b>ข้อสังเกต</b><br>' + '<br>'.join('• ' + n for n in bkk_notes) + '</div>',
                             unsafe_allow_html=True)
 
-            summ = st.session_state.get('bkk_summary')
+            summ = st.session_state.get(f'{K}_summary')
             if summ is not None:
                 st.write("")
                 st.markdown("##### 🧊 Dry Ice — สินค้า 4AOB / 4HFF")
@@ -2699,24 +2741,37 @@ def _render_bkk():
                             file_name=f"product_code_not_found_{bkk_file.name.rsplit('.', 1)[0]}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True,
-                            key="bkk_missing_codes_btn",
+                            key=f"{K}_missing_codes_btn",
                             help="รหัสสินค้าใน Sheet1 ที่ไม่มีใน Product Master — เอาไปเพิ่มใน Google Sheets แล้วกดทำใบงานใหม่ น้ำหนักจะครบขึ้น",
                         )
                 else:
                     st.markdown(
                         f'<div class="rcm-card rcm-card-warn">⚠️ ไม่ได้คิดน้ำหนัก — โหลด Product Master ไม่ได้ '
-                        f'({st.session_state.get("bkk_product_err") or "-"}) · ใบงานยังทำได้ตามปกติ แค่ช่องน้ำหนักว่าง</div>',
+                        f'({st.session_state.get(K + "_product_err") or "-"}) · ใบงานยังทำได้ตามปกติ แค่ช่องน้ำหนักว่าง</div>',
                         unsafe_allow_html=True)
 
             st.write("")
             st.download_button(
-                "⬇️ ดาวน์โหลดใบงาน For BKK (Excel: Sheet1 + Order + Retail + InterExp-B&W + No Cust Type)",
-                data=st.session_state['bkk_xlsx'],
-                file_name=f"{bkk_file.name.rsplit('.', 1)[0]}_For_BKK.xlsx",
+                f"⬇️ ดาวน์โหลดใบงาน For {NAME} (Excel: Sheet1 + Order"
+                + ("" if merged else " + Retail + InterExp-B&W") + " + No Cust Type)",
+                data=st.session_state[f'{K}_xlsx'],
+                file_name=f"{bkk_file.name.rsplit('.', 1)[0]}_For_{NAME}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
-                key="bkk_download_btn",
+                key=f"{K}_download_btn",
             )
+
+
+def _render_bkk():
+    _render_sheet1('BKK')
+
+
+def _render_pkt_sheet1():
+    _render_sheet1('PKT')
+
+
+def _render_samui_sheet1():
+    _render_sheet1('SAMUI')
 
 
 # ============================================================
@@ -3825,8 +3880,9 @@ def _render_inter():
 REGION_TABS = {
     'BKK': [("🏙️  For BKK", _render_bkk), ("📦  InterExp Manifest", _render_inter), ("📍  ใส่พิกัด Lat/Lon", _render_coords),
             ("⚖️  Weight Calculator", _render_weight), ("🔗  QR Code", _render_qr)],
-    'PKT': [("🏝️  For PKT", _render_pkt), ("📍  ใส่พิกัด Lat/Lon", _render_coords), ("🔗  QR Code", _render_qr)],
-    'SAMUI': [("📍  ใส่พิกัด Lat/Lon", _render_coords), ("🔗  QR Code", _render_qr)],
+    'PKT': [("🏝️  For PKT", _render_pkt_sheet1), ("📍  ใส่พิกัด Lat/Lon", _render_coords), ("🔗  QR Code", _render_qr),
+            ("🧾  For PKT (ไฟล์ Invoice เดิม)", _render_pkt)],
+    'SAMUI': [("🌴  For SAMUI", _render_samui_sheet1), ("📍  ใส่พิกัด Lat/Lon", _render_coords), ("🔗  QR Code", _render_qr)],
 }
 
 _region_tabs = REGION_TABS.get(region, REGION_TABS['BKK'])
