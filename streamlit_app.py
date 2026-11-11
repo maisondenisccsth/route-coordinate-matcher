@@ -3334,11 +3334,16 @@ def _inter_is_interexp_route(route):
     return key.startswith('INTEREXP')
 
 
+def _inter_pick(orders):
+    """ออเดอร์ที่ลงใบ Manifest: Cust Type R ทุก Route + ออเดอร์ Route InterExp ทุก Cust Type (เช่น F)"""
+    return orders['Cust Type'].map(_inter_is_retail) | orders['Route'].map(_inter_is_interexp_route)
+
+
 def inter_order_rows(orders, lines_df, dates=None):
-    """ออเดอร์ Cust Type R ทั้งหมดใน Sheet1 (ทุก Route) -> แถวใน Manifest
+    """ออเดอร์ Cust Type R ทั้งหมดใน Sheet1 (ทุก Route) + Route InterExp ที่ไม่ใช่ R -> แถวใน Manifest
     ประเภทสินค้าดูจากตัวแรกของ Product Code: 1, 2 = ยาธรรมดา / 3, 4 = ยาเย็น
     ออเดอร์ที่มีทั้งสองแบบ -> แยกเป็น 2 แถว (แถวละประเภท)"""
-    df = orders[orders['Cust Type'].map(_inter_is_retail)].copy()
+    df = orders[_inter_pick(orders)].copy()
     if dates is not None:
         keep = set(str(d) for d in dates)
         df = df[df['Order Date'].astype(str).isin(keep)]
@@ -3767,7 +3772,7 @@ def _render_inter():
     except Exception:
         st.warning("⚠️ ยังไม่ได้ติดตั้ง pythainlp (เพิ่มใน requirements.txt) — จับคู่ชื่อไทยได้น้อยลง ต้องเลือกเองมากขึ้น")
 
-    all_inter = orders[orders['Cust Type'].map(_inter_is_retail)]
+    all_inter = orders[_inter_pick(orders)]
     dates = sorted({str(d) for d in all_inter['Order Date'] if d is not None})
     sel_dates = None
     if len(dates) > 1:
@@ -3781,9 +3786,9 @@ def _render_inter():
 
     rows = inter_order_rows(orders, info['lines_df'], dates=sel_dates)
     if rows.empty:
-        st.warning("ไม่พบออเดอร์ Cust Type R ใน Sheet1")
+        st.warning("ไม่พบออเดอร์ Cust Type R หรือ Route InterExp ใน Sheet1")
         return
-    sig = (route_file.name, len(route_bytes), tpl_file.name, len(tpl_bytes), 'R', tuple(sel_dates or []))
+    sig = (route_file.name, len(route_bytes), tpl_file.name, len(tpl_bytes), 'R', tuple(sel_dates or []), 'R+InterExp')
     if st.session_state.get('inter_sig') != sig:
         with st.spinner("🔎 กำลังจับคู่ชื่อภาษาไทย..."):
             master_df = load_master_data(MASTER_SHEET_CSV_URL)
@@ -3805,7 +3810,7 @@ def _render_inter():
     n_split = int(rows['แยกแถว'].sum())
     st.markdown(f"""
     <div class="rcm-card">
-        📄 Cust Type R {rows['OrderNo'].nunique():,} ออเดอร์ → <b>{len(rows):,} แถว</b> ({(len(rows) + 9) // 10:,} แผ่น แผ่นละ 10)
+        📄 {rows['OrderNo'].nunique():,} ออเดอร์ (Cust Type R + Route InterExp) → <b>{len(rows):,} แถว</b> ({(len(rows) + 9) // 10:,} แผ่น แผ่นละ 10)
         · ✅ จับคู่ชื่อไทยอัตโนมัติ {n_auto:,} แถว · ⚠️ ต้องตรวจ {n_warn:,} แถว
         {f" · มี {n_split:,} แถวที่มาจากออเดอร์ที่มีทั้งยาธรรมดาและยาเย็น (แยกเป็น 2 แถว)" if n_split else ''}
     </div>
@@ -3815,8 +3820,10 @@ def _render_inter():
     by_route = r_orders['Route'].map(lambda v: '' if v is None else str(v).strip()).value_counts()
     route_text = ' · '.join(f"{k or '(ว่าง)'}: {v:,}" for k, v in by_route.items())
     f_inter = sel[sel['Route'].map(_inter_is_interexp_route) & ~sel['Cust Type'].map(_inter_is_retail)]
+    ct_text = ' · '.join(f"{k or '(ว่าง)'}: {v:,}" for k, v in f_inter['Cust Type'].map(
+        lambda v: '' if v is None else str(v).strip()).value_counts().items())
     st.caption(f"ออเดอร์ R แยกตาม Route: {route_text}"
-               + (f" · ⚠️ Route InterExp ที่ไม่ใช่ R {len(f_inter):,} ออเดอร์ ไม่ได้อยู่ในใบนี้" if len(f_inter) else ""))
+               + (f" · บวก Route InterExp ที่ไม่ใช่ R {len(f_inter):,} ออเดอร์ (Cust Type {ct_text})" if len(f_inter) else ""))
     st.caption("แถว ⚠️ อยู่บนสุดของตาราง — เลือกชื่อไทยให้ถูก (พิมพ์ค้นหาได้) แล้ว **ติ๊กช่อง ยืนยัน** แถวที่ไม่ได้ติ๊กจะไม่ลงใบ Manifest แต่ไปอยู่ชีท NeedReview "
                "· ถ้าไม่มีชื่อไทยที่ถูก เลือก \"— ไม่เลือก —\" แล้วติ๊กยืนยัน = ใช้ชื่อ/ที่อยู่ภาษาอังกฤษ "
                "· แผ่น/ลำดับ = ตำแหน่งในไฟล์ Manifest")
