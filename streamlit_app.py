@@ -4110,6 +4110,7 @@ def _render_inter():
             master_df = load_master_data(MASTER_SHEET_CSV_URL)
             t = rows.reset_index(drop=True).copy()
             t['ขนส่ง'] = [CARRIER_BW if _is_bw_route(r) else CARRIER_IE for r in t['Route']]
+            t['ส่ง B&W'] = t['ขนส่ง'] == CARRIER_BW
             t['มูลค่า'] = t['OrderNo'].map(values)
             for k, carrier, dirx in (('ie', CARRIER_IE, ie_dir), ('bw', CARRIER_BW, bw_dir)):
                 if dirx is None:
@@ -4135,6 +4136,8 @@ def _render_inter():
             st.session_state['mf_sig'] = sig
             st.session_state['mf_ver'] = st.session_state.get('mf_ver', 0) + 1
     table = st.session_state['mf_table']
+    if 'ส่ง B&W' not in table:
+        table['ส่ง B&W'] = table['ขนส่ง'] == CARRIER_BW
 
     r_orders = sel[sel['Cust Type'].map(_inter_is_retail)]
     by_route = r_orders['Route'].map(lambda v: '' if v is None else str(v).strip()).value_counts()
@@ -4152,7 +4155,7 @@ def _render_inter():
     """, unsafe_allow_html=True)
     st.caption(f"ออเดอร์ R แยกตาม Route: {route_text}"
                + (f" · บวก Route InterExp ที่ไม่ใช่ R {len(f_inter):,} ออเดอร์" if len(f_inter) else ""))
-    st.caption("**ช่อง ขนส่ง** เลือกได้ทีละแถวว่าไป InterExp หรือ Blue&White (ค่าเริ่มต้น: Route IE,B&W = Blue&White) — "
+    st.caption("**ติ๊กช่อง ส่ง B&W** = ออเดอร์นั้นไป Blue&White, ไม่ติ๊ก = InterExp (ค่าเริ่มต้น: Route IE,B&W ติ๊กไว้ให้แล้ว) — "
                "เปลี่ยนแล้วคำแนะนำชื่อไทยจะเปลี่ยนเป็นรายชื่อของเจ้านั้นให้เอง (ต้องติ๊กยืนยันใหม่) · "
                "แถว ⚠️ อยู่บนสุด — เลือกชื่อไทยให้ถูก แล้ว **ติ๊ก ยืนยัน** แถวที่ไม่ได้ติ๊กไปอยู่ชีท NeedReview · "
                "ชื่อที่ขึ้นต้น [IE] = รายชื่อ InterExp, [BW] = รายชื่อ Blue&White")
@@ -4167,13 +4170,13 @@ def _render_inter():
         table = t
     options = [INTER_NONE] + sorted({_mf_label(CARRIER_IE, d) for d in (ie_dir or [])}) \
         + sorted({_mf_label(CARRIER_BW, d) for d in (bw_dir or [])})
-    show_cols = ['ยืนยัน', 'ขนส่ง', 'สถานะ', 'แผ่น', 'ลำดับ', 'OrderNo', 'ShipTo Name', 'ประเภทสินค้า', 'เลือกชื่อไทย', 'คำแนะนำ', 'คะแนน']
+    show_cols = ['ยืนยัน', 'ส่ง B&W', 'สถานะ', 'แผ่น', 'ลำดับ', 'OrderNo', 'ShipTo Name', 'ประเภทสินค้า', 'เลือกชื่อไทย', 'คำแนะนำ', 'คะแนน']
     hidden = [c for c in table.columns if c not in show_cols]
     edited = st.data_editor(
         table[show_cols + hidden],
         column_config={
             'ยืนยัน': st.column_config.CheckboxColumn('ยืนยัน', help="ติ๊กเมื่อตรวจแล้วว่าชื่อไทยถูก (หรือยอมใช้ภาษาอังกฤษ)", width='small'),
-            'ขนส่ง': st.column_config.SelectboxColumn('ขนส่ง', options=[CARRIER_IE, CARRIER_BW], required=True, width='small'),
+            'ส่ง B&W': st.column_config.CheckboxColumn('ส่ง B&W', help="ติ๊ก = ส่ง Blue&White / ไม่ติ๊ก = ส่ง InterExp", width=90),
             'แผ่น': st.column_config.NumberColumn('แผ่น', width='small'),
             'ลำดับ': st.column_config.NumberColumn('ลำดับ', width='small'),
             'เลือกชื่อไทย': st.column_config.SelectboxColumn('เลือกชื่อไทย', options=options, width='large', required=True),
@@ -4185,20 +4188,23 @@ def _render_inter():
         hide_index=True, use_container_width=True, key=ed_key,
         height=(min(len(table), 15) + 1) * 35 + 3,
     )
-    # เปลี่ยนขนส่งในตาราง -> ใช้คำแนะนำของเจ้าใหม่ (ทั้งออเดอร์ ถ้าออเดอร์แยก 2 แถว) แล้ววาดตารางใหม่
-    changed = [i for i in table.index if edited.at[i, 'ขนส่ง'] != table.at[i, 'ขนส่ง']]
+    # ติ๊ก/เอาติ๊ก ส่ง B&W -> ใช้คำแนะนำของเจ้าใหม่ (ทั้งออเดอร์ ถ้าออเดอร์แยก 2 แถว) แล้ววาดตารางใหม่
+    changed = [i for i in table.index if bool(edited.at[i, 'ส่ง B&W']) != bool(table.at[i, 'ส่ง B&W'])]
     if changed:
         t = _inter_apply_edits(table, st.session_state.get(ed_key))
         idx = set()
         for i in changed:
+            to_bw = bool(t.at[i, 'ส่ง B&W'])
             same = t.index[t['OrderNo'] == t.at[i, 'OrderNo']]
-            t.loc[same, 'ขนส่ง'] = t.at[i, 'ขนส่ง']
+            t.loc[same, 'ส่ง B&W'] = to_bw
+            t.loc[same, 'ขนส่ง'] = CARRIER_BW if to_bw else CARRIER_IE
             idx.update(same)
         t = _mf_positions(_mf_apply_carrier(t, sorted(idx)))
         st.session_state['mf_table'] = t
         st.session_state['mf_ver'] = st.session_state.get('mf_ver', 0) + 1
         st.rerun()
 
+    edited['ขนส่ง'] = [CARRIER_BW if bool(v) else CARRIER_IE for v in edited['ส่ง B&W']]
     for carrier, kind, tfile, tbytes, dirx in ((CARRIER_IE, 'inter', tpl_file, tpl_bytes, ie_dir),
                                                (CARRIER_BW, 'bw', bw_file, bw_bytes, bw_dir)):
         sub = edited[edited['ขนส่ง'] == carrier]
