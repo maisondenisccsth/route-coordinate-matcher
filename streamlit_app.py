@@ -3860,13 +3860,81 @@ def bw_order_rows(orders, lines_df):
     return pd.DataFrame(rows)
 
 
+BW_REGIONS = ['กลาง', 'เหนือ', 'อีสาน', 'ใต้']
+BW_NO_REGION = 'ไม่ระบุภาค'
+
+
+def _bw_norm(name):
+    return re.sub(r'\s+', ' ', str(name or '').strip())
+
+
+def bw_region_map(template_bytes):
+    """ชีทในเทมเพลต Blue&White ที่มีหัวคอลัมน์ 'ลูกค้า' + 'ภาค' -> {ชื่อสาขา: ภาค}
+    ชื่อเดียวกันที่อยู่หลายภาค -> None (ไม่เดา ให้ผู้ใช้เลือกเอง) · ไม่มีชีทนี้ -> {} (ไม่แยกภาค)"""
+    wb = load_workbook(io.BytesIO(template_bytes), read_only=True, data_only=True)
+    out = {}
+    try:
+        for ws in wb.worksheets:
+            rows = ws.iter_rows(values_only=True)
+            head = next(rows, None) or ()
+            hs = [str(h).strip() if h is not None else '' for h in head]
+            if 'ภาค' not in hs or not any('ลูกค้า' in h for h in hs):
+                continue
+            ci = next(i for i, h in enumerate(hs) if 'ลูกค้า' in h)
+            ri = hs.index('ภาค')
+            seen = {}
+            for r in rows:
+                if r is None or len(r) <= max(ci, ri) or _cell_blank(r[ci]) or _cell_blank(r[ri]):
+                    continue
+                seen.setdefault(_bw_norm(r[ci]), set()).add(str(r[ri]).strip())
+            out = {k: (next(iter(v)) if len(v) == 1 else None) for k, v in seen.items()}
+            break
+    finally:
+        wb.close()
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def bw_region_map_cached(template_bytes):
+    return bw_region_map(template_bytes)
+
+
+def _xlsx_next_part(parts, folder, stem):
+    n = 1
+    while f'{folder}/{stem}{n}.xml' in parts:
+        n += 1
+    return f'{folder}/{stem}{n}.xml', n
+
+
+def _xlsx_add_sheet(parts, name, sheet_xml, after_rid=None, sheet_rels=None):
+    """เพิ่มชีทใหม่ลงในไฟล์ (parts = {ชื่อไฟล์ใน zip: bytes}) — ต่อท้าย หรือวางถัดจากชีท after_rid -> rId ของชีทใหม่"""
+    part, _ = _xlsx_next_part(parts, 'xl/worksheets', 'sheet')
+    wb = parts['xl/workbook.xml'].decode('utf-8')
+    wr = parts['xl/_rels/workbook.xml.rels'].decode('utf-8')
+    ct = parts['[Content_Types].xml'].decode('utf-8')
+    rid = 'rId' + str(max([int(x) for x in re.findall(r'Id="rId(\d+)"', wr)] or [0]) + 1)
+    sid = max([int(x) for x in re.findall(r'sheetId="(\d+)"', wb)] or [0]) + 1
+    tag = f'<sheet name="{_inter_xml_escape(name)}" sheetId="{sid}" r:id="{rid}"/>'
+    m = re.search(r'<sheet [^>]*r:id="%s"[^>]*/>' % re.escape(after_rid), wb) if after_rid else None
+    wb = (wb[:m.end()] + tag + wb[m.end():]) if m else wb.replace('</sheets>', tag + '</sheets>', 1)
+    wr = wr.replace('</Relationships>', f'<Relationship Id="{rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{part[3:]}"/></Relationships>', 1)
+    ct = ct.replace('</Types>', f'<Override PartName="/{part}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>', 1)
+    parts['xl/workbook.xml'], parts['xl/_rels/workbook.xml.rels'], parts['[Content_Types].xml'] = \
+        wb.encode('utf-8'), wr.encode('utf-8'), ct.encode('utf-8')
+    parts[part] = sheet_xml.encode('utf-8')
+    if sheet_rels:
+        parts[_inter_rels_path(part)] = sheet_rels.encode('utf-8')
+    return rid
+
+
 def bw_final_rows(edited, directory):
     by_label = {_inter_label(d): d for d in directory}
     out = []
     for _, r in edited.iterrows():
         d = by_label.get(r['เลือกชื่อไทย'])
         out.append({'เลขที่บิล': str(r['OrderNo']), 'ชื่อผู้รับ': d['name'] if d is not None else r['ShipTo Name'],
-                    'มูลค่า': r.get('มูลค่า'), '_thai': d is not None})
+                    'มูลค่า': r.get('มูลค่า'), '_thai': d is not None,
+                    'ภาค': (r.get('ภาค') or '') if isinstance(r.get('ภาค'), str) else ''})
     return pd.DataFrame(out)
 
 
@@ -3908,6 +3976,9 @@ def _bw_trim(sheet_xml, drawing_xml, end_row):
     sheet_xml = re.sub(r'<mergeCells count="\d+"', f'<mergeCells count="{n_merge}"', sheet_xml)
     if n_merge == 0:
         sheet_xml = re.sub(r'<mergeCells count="0"\s*>\s*</mergeCells>', '', sheet_xml)
+    sheet_xml = re.sub(r'topLeftCell="[A-Z]+\d+"', 'topLeftCell="A1"', sheet_xml)
+    sheet_xml = re.sub(r'(<selection [^>]*?)activeCell="[A-Z]+\d+"', r'\1activeCell="A1"', sheet_xml)
+    sheet_xml = re.sub(r'(<selection [^>]*?)sqref="[^"]*"', r'\1sqref="A1"', sheet_xml)
     sheet_xml = re.sub(r'<dimension ref="([A-Z]+\d+):([A-Z]+)\d+"', lambda m: f'<dimension ref="{m.group(1)}:{m.group(2)}{end_row}"',
                        sheet_xml)
     if drawing_xml:
@@ -3919,9 +3990,10 @@ def _bw_trim(sheet_xml, drawing_xml, end_row):
 
 
 def bw_build_files(template_bytes, rows, ship_date, deliver_text, review=None):
-    """rows (หลังผู้ใช้เลือกชื่อไทยแล้ว) -> ([(ลำดับไฟล์, bytes)], จำนวนแผ่น)
-    เขียนลงชีท blue แผ่นละ 15 แถว (ลำดับเริ่ม 1 ใหม่ทุกแผ่น) ใส่วันที่ส่ง / แผ่นที่ ที่หัวแผ่น แล้วตัดแผ่นที่ไม่ได้ใช้ทิ้ง
-    ชีท File และส่วนอื่นของเทมเพลตไม่แตะ"""
+    """rows (หลังผู้ใช้เลือกชื่อไทยแล้ว) -> ([(1, bytes)], จำนวนแผ่นรวม)
+    ฟอร์มในชีท blue แผ่นละ 15 แถว (ลำดับเริ่ม 1 ใหม่ทุกแผ่น) ใส่วันที่ส่ง / แผ่นที่ ที่หัวแผ่น แล้วตัดแผ่นที่ไม่ได้ใช้ทิ้ง
+    ถ้า rows มีคอลัมน์ 'ภาค' -> ชีทละภาค (กลาง / เหนือ / อีสาน / ใต้ / ไม่ระบุภาค) แต่ละชีทเป็นสำเนาของฟอร์ม blue
+    ชีทอื่นของเทมเพลต (File, รายชื่อภาค) ไม่แตะ"""
     import zipfile, copy
     from datetime import date as _date
     sheet_name, pages = bw_template_pages(template_bytes)
@@ -3931,29 +4003,37 @@ def bw_build_files(template_bytes, rows, ship_date, deliver_text, review=None):
     infos = zin.infolist()
     orig = {i.filename: zin.read(i.filename) for i in infos}
     path = dict(_inter_sheet_paths(zin)).get(sheet_name)
+    sheet_rels = orig.get(_inter_rels_path(path), b'').decode('utf-8')
     drawing_path = None
-    rels = orig.get(_inter_rels_path(path), b'').decode('utf-8')
-    for tag in re.findall(r'<Relationship [^>]*>', rels):
+    for tag in re.findall(r'<Relationship [^>]*>', sheet_rels):
         if '/drawing"' in tag:
             drawing_path = _inter_resolve(path, re.search(r'Target="([^"]+)"', tag).group(1))
-    recs = rows.to_dict('records')
-    chunks = [recs[i:i + BW_ROWS_PER_PAGE] for i in range(0, len(recs), BW_ROWS_PER_PAGE)]
-    per_file = len(pages)
-    n_files = max(1, (len(chunks) + per_file - 1) // per_file)
-    total = max(1, len(chunks))
     d = ship_date.date() if hasattr(ship_date, 'date') else ship_date
     serial = (d - _date(1899, 12, 30)).days
-    files = []
-    for f_i in range(n_files):
-        fp = chunks[f_i * per_file:(f_i + 1) * per_file]
-        keep = max(1, len(fp))
+    cap = len(pages) * BW_ROWS_PER_PAGE
+
+    # กลุ่มชีท: [(ชื่อชีท, rows)]
+    recs = rows.to_dict('records')
+    groups = []
+    if 'ภาค' in rows.columns and len(rows):
+        for reg in BW_REGIONS + [BW_NO_REGION]:
+            part_recs = [r for r in recs if ((r.get('ภาค') or '') if (r.get('ภาค') or '') in BW_REGIONS else BW_NO_REGION) == reg]
+            for k in range(0, len(part_recs), cap):
+                groups.append((reg if k == 0 else f'{reg} ({k // cap + 1})', part_recs[k:k + cap]))
+    else:
+        for k in range(0, max(len(recs), 1), cap):
+            groups.append((sheet_name if k == 0 else f'{sheet_name} ({k // cap + 1})', recs[k:k + cap]))
+
+    def fill(group_recs):
+        chunks = [group_recs[i:i + BW_ROWS_PER_PAGE] for i in range(0, len(group_recs), BW_ROWS_PER_PAGE)]
+        keep, total = max(1, len(chunks)), max(1, len(chunks))
         vals = {}
         for p_i, pg in enumerate(pages[:keep]):
-            chunk = fp[p_i] if p_i < len(fp) else []
+            chunk = chunks[p_i] if p_i < len(chunks) else []
             if pg['date']:
                 vals[pg['date']] = serial
             if pg['page']:
-                vals[pg['page']] = f'{f_i * per_file + p_i + 1}/{total}'
+                vals[pg['page']] = f'{p_i + 1}/{total}'
             for k, r in enumerate(pg['data']):
                 rec = chunk[k] if k < len(chunk) else None
                 for c in 'ABCDEFGHIJKLM':
@@ -3966,24 +4046,61 @@ def bw_build_files(template_bytes, rows, ship_date, deliver_text, review=None):
         xml = _inter_set_cells(_xml_ensure_cells(orig[path].decode('utf-8'), vals.keys()), vals)
         dxml = orig[drawing_path].decode('utf-8') if drawing_path in orig else None
         xml, dxml = _bw_trim(xml, dxml, pages[keep - 1]['end'])
-        new_xml = {path: xml}
+        return xml, dxml, len(chunks)
+
+    parts = dict(orig)
+    total_pages = 0
+    wb_xml = parts['xl/workbook.xml'].decode('utf-8')
+    base_rid = re.search(r'<sheet [^>]*name="%s"[^>]*r:id="([^"]+)"' % re.escape(_inter_xml_escape(sheet_name)), wb_xml).group(1)
+    prev_rid = base_rid
+    for g_i, (gname, grecs) in enumerate(groups):
+        xml, dxml, n_pages = fill(grecs)
+        total_pages += n_pages
+        if g_i == 0:
+            parts[path] = xml.encode('utf-8')
+            if dxml is not None:
+                parts[drawing_path] = dxml.encode('utf-8')
+            if gname != sheet_name:
+                wb_xml = parts['xl/workbook.xml'].decode('utf-8')
+                wb_xml = re.sub(r'(<sheet [^>]*)name="%s"' % re.escape(_inter_xml_escape(sheet_name)),
+                                lambda m: m.group(1) + f'name="{_inter_xml_escape(gname)}"', wb_xml, count=1)
+                parts['xl/workbook.xml'] = wb_xml.encode('utf-8')
+            continue
+        # ชีทถัดไป = สำเนาฟอร์ม + สำเนารูปโลโก้ของชีทนั้นเอง (ไม่ใช้ drawing ร่วมกัน)
+        xml = re.sub(r'\stabSelected="1"', '', xml)
+        rels = sheet_rels
         if dxml is not None:
-            new_xml[drawing_path] = dxml
-        add_parts = {}
-        if f_i == 0 and review is not None and len(review):
-            _inter_add_review_sheet(zin, review, new_xml, add_parts)
-        parts = dict(orig)
-        parts.update({k: v.encode('utf-8') for k, v in new_xml.items()})
-        parts.update({k: v.encode('utf-8') for k, v in add_parts.items()})
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for item in infos:
-                if item.filename in parts:
-                    zout.writestr(copy.copy(item), parts.pop(item.filename))
-            for name, data in parts.items():
-                zout.writestr(name, data)
-        files.append((f_i + 1, buf.getvalue()))
-    return files, len(chunks)
+            dpart, dn = _xlsx_next_part(parts, 'xl/drawings', 'drawing')
+            parts[dpart] = dxml.encode('utf-8')
+            drels = orig.get(_inter_rels_path(drawing_path))
+            if drels:
+                parts[_inter_rels_path(dpart)] = drels
+            ct = parts['[Content_Types].xml'].decode('utf-8').replace(
+                '</Types>', f'<Override PartName="/{dpart}" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/></Types>', 1)
+            parts['[Content_Types].xml'] = ct.encode('utf-8')
+            rels = re.sub(r'Target="[^"]*drawing\d+\.xml"', f'Target="../drawings/drawing{dn}.xml"', rels)
+        pm = re.search(r'Target="([^"]*printerSettings\d+\.bin)"', rels or '')
+        if pm:
+            src = _inter_resolve(path, pm.group(1))
+            if src in orig:
+                n = 1
+                while f'xl/printerSettings/printerSettings{n}.bin' in parts:
+                    n += 1
+                parts[f'xl/printerSettings/printerSettings{n}.bin'] = orig[src]
+                rels = rels.replace(pm.group(0), f'Target="../printerSettings/printerSettings{n}.bin"')
+        prev_rid = _xlsx_add_sheet(parts, gname, xml, after_rid=prev_rid, sheet_rels=rels or None)
+    if review is not None and len(review):
+        if INTER_REVIEW_SHEET not in dict(_inter_sheet_paths_from(parts['xl/workbook.xml'].decode('utf-8'),
+                                                                  parts['xl/_rels/workbook.xml.rels'].decode('utf-8'))):
+            _xlsx_add_sheet(parts, INTER_REVIEW_SHEET, _inter_review_sheet_xml(review))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for item in infos:
+            if item.filename in parts:
+                zout.writestr(copy.copy(item), parts.pop(item.filename))
+        for name, data in parts.items():
+            zout.writestr(name, data)
+    return [(1, buf.getvalue())], total_pages
 
 
 def inter_final_rows(edited, directory):
@@ -4039,6 +4156,20 @@ def _mf_apply_carrier(t, idx):
     return t
 
 
+def _mf_auto_region(t, idx, region_map):
+    """ภาคของแถว B&W = ภาคของชื่อไทยที่เลือกไว้ จากรายชื่อภาคในเทมเพลต
+    ยังไม่ได้เลือกชื่อ / ชื่อไม่อยู่ในรายชื่อภาค / ชื่ออยู่หลายภาค -> ว่าง (ไม่เดาจากคำแนะนำ)"""
+    tag = MF_TAG[CARRIER_BW]
+    for i in idx:
+        if t.at[i, 'ขนส่ง'] != CARRIER_BW or not region_map:
+            t.at[i, 'ภาค'] = None
+            continue
+        sel = t.at[i, 'เลือกชื่อไทย']
+        name = sel[len(tag):] if isinstance(sel, str) and sel.startswith(tag) else ''
+        t.at[i, 'ภาค'] = region_map.get(_bw_norm(name)) or None
+    return t
+
+
 def _mf_positions(t):
     """แผ่น / ลำดับ ในไฟล์ของแต่ละขนส่ง (เรียงตาม OrderNo) — B&W 1 ออเดอร์ = 1 แถว, แผ่นละ 15 / InterExp แผ่นละ 10"""
     t['แผ่น'], t['ลำดับ'] = None, None
@@ -4083,6 +4214,7 @@ def _render_inter():
         orders, info = read_bkk_orders(route_bytes)
         ie_dir = inter_directory_cached(tpl_bytes) if tpl_bytes else None
         bw_dir = bw_directory_cached(bw_bytes) if bw_bytes else None
+        region_map = bw_region_map_cached(bw_bytes) if bw_bytes else {}
     except Exception as e:
         st.error(f"อ่านไฟล์ไม่ได้: {e}")
         return
@@ -4133,8 +4265,9 @@ def _render_inter():
                 if c not in t:
                     t[c] = None
             t['_ord'] = range(len(t))
-            t['InterExp'], t['B&W'] = False, False
+            t['InterExp'], t['B&W'], t['ภาค'] = False, False, None
             t = _mf_apply_carrier(t, t.index)
+            t = _mf_auto_region(t, t.index, region_map)
             t = _mf_positions(t)
             # แถว ⚠️ ไว้บนสุด (ตอนสร้างไฟล์จะเรียงกลับตาม OrderNo)
             t = t.sort_values(['สถานะ', '_ord'], key=lambda s: s.eq('✅ อัตโนมัติ') if s.name == 'สถานะ' else s,
@@ -4145,6 +4278,8 @@ def _render_inter():
     table = st.session_state['mf_table']
     if 'B&W' not in table:
         table['InterExp'], table['B&W'] = table['ขนส่ง'] == CARRIER_IE, table['ขนส่ง'] == CARRIER_BW
+    if 'ภาค' not in table:
+        table['ภาค'] = None
 
     r_orders = sel[sel['Cust Type'].map(_inter_is_retail)]
     by_route = r_orders['Route'].map(lambda v: '' if v is None else str(v).strip()).value_counts()
@@ -4172,13 +4307,14 @@ def _render_inter():
         t = _inter_apply_edits(st.session_state['mf_table'], st.session_state.get(ed_key))
         mask = (t['เลือกชื่อไทย'] == INTER_NONE) & (t['คำแนะนำ'] != '')
         t.loc[mask, 'เลือกชื่อไทย'] = t.loc[mask, 'คำแนะนำ']
+        t = _mf_auto_region(t, t.index[mask], region_map)
         st.session_state['mf_table'] = t
         st.session_state['mf_ver'] = st.session_state.get('mf_ver', 0) + 1
         ed_key = f"mf_editor_{st.session_state['mf_ver']}"
         table = t
     options = [INTER_NONE] + sorted({_mf_label(CARRIER_IE, d) for d in (ie_dir or [])}) \
         + sorted({_mf_label(CARRIER_BW, d) for d in (bw_dir or [])})
-    show_cols = ['ยืนยัน', 'InterExp', 'B&W', 'สถานะ', 'แผ่น', 'ลำดับ', 'OrderNo', 'ShipTo Name', 'ประเภทสินค้า', 'เลือกชื่อไทย', 'คำแนะนำ', 'คะแนน']
+    show_cols = ['ยืนยัน', 'InterExp', 'B&W'] + (['ภาค'] if region_map else []) + ['สถานะ', 'แผ่น', 'ลำดับ', 'OrderNo', 'ShipTo Name', 'ประเภทสินค้า', 'เลือกชื่อไทย', 'คำแนะนำ', 'คะแนน']
     hidden = [c for c in table.columns if c not in show_cols]
     edited = st.data_editor(
         table[show_cols + hidden],
@@ -4186,6 +4322,8 @@ def _render_inter():
             'ยืนยัน': st.column_config.CheckboxColumn('ยืนยัน', help="ติ๊กเมื่อตรวจแล้วว่าชื่อไทยถูก (หรือยอมใช้ภาษาอังกฤษ)", width='small'),
             'InterExp': st.column_config.CheckboxColumn('InterExp', help="ติ๊ก = ส่ง InterExp", width=80),
             'B&W': st.column_config.CheckboxColumn('B&W', help="ติ๊ก = ส่ง Blue&White", width=60),
+            'ภาค': st.column_config.SelectboxColumn('ภาค (B&W)', options=BW_REGIONS, required=False, width=90,
+                                                   help="ภาคของแถว Blue&White — ไฟล์ B&W แยกชีทตามภาค · ว่าง = ชีท ไม่ระบุภาค"),
             'แผ่น': st.column_config.NumberColumn('แผ่น', width='small'),
             'ลำดับ': st.column_config.NumberColumn('ลำดับ', width='small'),
             'เลือกชื่อไทย': st.column_config.SelectboxColumn('เลือกชื่อไทย', options=options, width='large', required=True),
@@ -4210,6 +4348,13 @@ def _render_inter():
             changed[i] = CARRIER_IE
         else:
             changed[i] = CARRIER_BW if bw_new else (CARRIER_IE if ie_new else '')
+    name_changed = [i for i in table.index if region_map and i not in changed
+                    and edited.at[i, 'เลือกชื่อไทย'] != table.at[i, 'เลือกชื่อไทย'] and table.at[i, 'ขนส่ง'] == CARRIER_BW]
+    if name_changed and not changed:
+        t = _mf_auto_region(_inter_apply_edits(table, st.session_state.get(ed_key)), name_changed, region_map)
+        st.session_state['mf_table'] = t
+        st.session_state['mf_ver'] = st.session_state.get('mf_ver', 0) + 1
+        st.rerun()
     if changed:
         t = _inter_apply_edits(table, st.session_state.get(ed_key))
         idx = set()
@@ -4217,7 +4362,7 @@ def _render_inter():
             same = t.index[t['OrderNo'] == t.at[i, 'OrderNo']]
             t.loc[same, 'ขนส่ง'] = carrier
             idx.update(same)
-        t = _mf_positions(_mf_apply_carrier(t, sorted(idx)))
+        t = _mf_positions(_mf_auto_region(_mf_apply_carrier(t, sorted(idx)), sorted(idx), region_map))
         st.session_state['mf_table'] = t
         st.session_state['mf_ver'] = st.session_state.get('mf_ver', 0) + 1
         st.rerun()
@@ -4235,10 +4380,11 @@ def _render_inter():
         if tfile is None:
             st.info(f"อัปเทมเพลต {carrier} ด้านบนเพื่อสร้างไฟล์นี้")
             continue
-        _mf_build_section(carrier, kind, sub, tfile, tbytes, dirx, values, sheet_date, deliver_date, sig)
+        _mf_build_section(carrier, kind, sub, tfile, tbytes, dirx, values, sheet_date, deliver_date, sig,
+                          by_region=bool(region_map) and carrier == CARRIER_BW)
 
 
-def _mf_build_section(carrier, kind, sub, tfile, tbytes, dirx, values, sheet_date, deliver_date, sig):
+def _mf_build_section(carrier, kind, sub, tfile, tbytes, dirx, values, sheet_date, deliver_date, sig, by_region=False):
     is_bw = carrier == CARRIER_BW
     tag = MF_TAG[carrier]
     by_label = {_mf_label(carrier, d): d for d in dirx}
@@ -4250,7 +4396,16 @@ def _mf_build_section(carrier, kind, sub, tfile, tbytes, dirx, values, sheet_dat
     if len(pending):
         st.warning(f"⚠️ {carrier}: ยังไม่ได้ยืนยัน {len(pending):,} แถว — สร้างไฟล์ได้ แต่แถวที่ไม่ได้ติ๊กจะ**ไม่ลงใบ** "
                    f"จะแยกไปอยู่ชีท {INTER_REVIEW_SHEET} ท้ายไฟล์แทน")
+    if by_region:
+        conf = sub[sub['ยืนยัน'].astype(bool)].drop_duplicates('OrderNo')
+        cnt = conf['ภาค'].map(lambda v: v if v in BW_REGIONS else BW_NO_REGION).value_counts()
+        parts_txt = ' · '.join(f"{r}: {cnt[r]:,}" for r in BW_REGIONS + [BW_NO_REGION] if r in cnt)
+        st.caption(f"ไฟล์ B&W แยกชีทตามภาค (ออเดอร์ที่ยืนยันแล้ว) — {parts_txt or 'ยังไม่มีออเดอร์ที่ยืนยัน'}")
+        if BW_NO_REGION in cnt:
+            st.warning(f"⚠️ {cnt[BW_NO_REGION]:,} ออเดอร์ B&W ยังไม่มีภาค (ชื่อไม่อยู่ในรายชื่อภาคของเทมเพลต หรืออยู่หลายภาค) — "
+                       f"เลือกในช่อง ภาค ได้ ถ้าไม่เลือกจะไปอยู่ชีท {BW_NO_REGION}")
     edit_sig = (sig, tuple(sub['_ord']), tuple(sub['เลือกชื่อไทย']), tuple(sub['ยืนยัน'].astype(bool)),
+                tuple(sub['ภาค'].fillna('')) if 'ภาค' in sub else (),
                 sheet_date.strftime('%d/%m/%Y'), deliver_date.strftime('%d/%m/%Y'))
     btn_label = "🚀 สร้างไฟล์ Blue&White" if is_bw else "🚀 สร้างไฟล์ Manifest"
     if st.button(btn_label, type="primary", use_container_width=True, key=f"{kind}_btn"):
@@ -4273,6 +4428,8 @@ def _mf_build_section(carrier, kind, sub, tfile, tbytes, dirx, values, sheet_dat
             review['ที่อยู่ (อังกฤษ)'], review['City'], review['Province'] = review['_en_addr'], review['_en_city'], review['_en_prov']
             if is_bw:
                 final = bw_final_rows(s2[ok_mask], dirx)
+                if not by_region:
+                    final = final.drop(columns=['ภาค'])
                 files, pages = bw_build_files(tbytes, final, sheet_date,
                                               f"ส่ง {deliver_date.strftime('%d/%m/%Y')} ก่อน 14.00 น.", review=review)
             else:
@@ -4280,11 +4437,15 @@ def _mf_build_section(carrier, kind, sub, tfile, tbytes, dirx, values, sheet_dat
                 files, pages = inter_build_manifests(
                     tbytes, final, sheet_date.strftime('%d/%m/%Y'),
                     f"ส่งถึง {deliver_date.strftime('%d/%m/%y')} ก่อน 12.00 น.", review=review)
+            sheets_txt = ''
+            if is_bw and 'ภาค' in final.columns and len(final):
+                cnt = final['ภาค'].map(lambda v: v if v in BW_REGIONS else BW_NO_REGION).value_counts()
+                sheets_txt = ' · '.join(f"{r} {cnt[r]:,}" for r in BW_REGIONS + [BW_NO_REGION] if r in cnt)
             checked = sub[sub['ยืนยัน'].astype(bool) & (sub['สถานะ'] != '✅ อัตโนมัติ')]
             st.session_state[f'{kind}_files'] = files
             st.session_state[f'{kind}_result'] = {
                 'rows': len(final), 'pages': pages, 'english': int((~final['_thai']).sum()) if len(final) else 0,
-                'review': len(review), 'sig': edit_sig,
+                'review': len(review), 'sig': edit_sig, 'sheets': sheets_txt,
                 'checked': checked[['แผ่น', 'ลำดับ', 'OrderNo', 'ShipTo Name', 'เลือกชื่อไทย']].rename(
                     columns={'เลือกชื่อไทย': 'ชื่อที่ใช้ในใบ'}).replace({INTER_NONE: '(ภาษาอังกฤษ)'})}
         except Exception as e:
@@ -4297,6 +4458,8 @@ def _mf_build_section(carrier, kind, sub, tfile, tbytes, dirx, values, sheet_dat
         st.info(f"✏️ ตาราง/วันที่ถูกแก้หลังสร้างไฟล์ — กด \"{btn_label[2:]}\" ใหม่อีกครั้ง แล้วค่อยดาวน์โหลด")
         return
     msg = f"🎯 <b>เสร็จแล้ว!</b> ลงใบ {carrier} {res['rows']:,} แถว · {res['pages']:,} แผ่น"
+    if res.get('sheets'):
+        msg += f" · ชีทตามภาค: {res['sheets']}"
     if res['english']:
         msg += f" · {res['english']:,} แถวใช้ภาษาอังกฤษ (ยืนยันแล้ว)"
     if res['review']:
